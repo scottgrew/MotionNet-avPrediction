@@ -37,7 +37,7 @@ from womd.checkpoint import (
     previous_path,
     save_checkpoint,
 )
-from womd.metrics import LOG_EVERY_BATCHES, EpochProgress, Scalars
+from womd.metrics import LOG_EVERY_BATCHES, EpochProgress, Scalars, mean_or_nan
 from womd.model import MotionPredictor
 from womd.pipeline import BatchSettings
 from womd.views import TargetInputs
@@ -131,6 +131,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed-precision", action="store_true")
+    parser.add_argument("--holdout-directory", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -185,10 +186,58 @@ class TrainingRun:
                 f"no .npz scenarios in {arguments.staged_directory}"
             )
         self.paths = self.all_paths[self.rank :: self.process_count]
+        self.holdout_paths = self.find_holdout_paths()
         self.plan = self.plan_epochs(stored_plan)
         self.schedule = self.learning_rate_schedule()
         tensorboard = arguments.checkpoint_path.parent / "tensorboard"
         self.writer = SummaryWriter(tensorboard) if self.is_main else None
+
+    def find_holdout_paths(self) -> list[Path]:
+        """The held-out scenes, none without --holdout-directory; a given
+        directory with no scenes is refused before any work starts.
+        """
+        directory = self.arguments.holdout_directory
+        if directory is None:
+            return []
+        paths = sorted(directory.glob("*.npz"))
+        if not paths:
+            raise FileNotFoundError(f"no .npz held-out scenes in {directory}")
+        return paths
+
+    def evaluate_holdout(self) -> Scalars:
+        """Loss, and minADE and minFDE over the 6 kept modes, for every
+        designated target in --holdout-directory, scenes training never
+        sees. Runs in float32 and changes no weight.
+        """
+        settings = BatchSettings(
+            batch_size=self.arguments.batch_size,
+            worker_count=0,
+            prefetch_batches=0,
+            seed=0,
+            designated_only=True,
+        )
+        progress = EpochProgress(self.device)
+        self.predictor.eval()
+        with torch.no_grad():
+            for host_batch in pipeline.batches(self.holdout_paths, settings):
+                batch = host_batch.each(lambda array: array.to(self.device))
+                rounds = self.predictor(batch)
+                progress.record(
+                    loss.round_loss_terms(rounds, batch), False, False
+                )
+                progress.sample_count += batch.agent_history.shape[0]
+                progress.add_kept_mode_errors(rounds[-1], batch)
+        self.predictor.train()
+        return {
+            **progress.loss_means("holdout/loss_"),
+            "holdout/ade_80step": mean_or_nan(
+                progress.ade_sum, progress.ade_count
+            ),
+            "holdout/fde_80step": mean_or_nan(
+                progress.fde_sum, progress.fde_count
+            ),
+            "holdout/targets": progress.sample_count,
+        }
 
     def main_decides(self, decision: bool) -> bool:
         """The main process's decision, sent to every process, so all of them
@@ -449,6 +498,10 @@ class TrainingRun:
             last_epoch_seconds = time.perf_counter() - epoch_start
             heading = f"epoch {epoch_index + 1}/{arguments.epochs}"
             self.report(heading, scalars, epoch_index + 1)
+            if self.holdout_paths and self.is_main:
+                holdout = self.evaluate_holdout()
+                heading = f"held-out after epoch {epoch_index + 1}"
+                self.report(heading, holdout, epoch_index + 1)
 
             total = scalars["epoch/loss_total"]
             if math.isfinite(total):

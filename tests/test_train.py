@@ -191,6 +191,7 @@ def test_kernel_command_line_parses(tmp_path):
     value_of_flag = {
         "--anchors": str(anchors_path),
         "--stop-after-seconds": "1.0",
+        "--holdout-directory": str(tmp_path),
     }
     completed_arguments = completed_flags(flag_arguments, value_of_flag)
     non_literal_count = element_count - len(literal_arguments)
@@ -450,3 +451,47 @@ def test_every_epoch_is_a_full_pass(tmp_path):
         run.run()
 
     assert epoch_paths == [run.paths, run.paths]
+
+
+def test_holdout_scores_every_designated_target_and_trains_nothing(tmp_path):
+    """The held-out pass sees each designated target in its directory once,
+    changes no weight and leaves the model training; an empty directory is
+    refused before any work starts.
+    """
+    staged = staged_copy(tmp_path / "staged", 0, 2)
+    holdout = staged_copy(tmp_path / "holdout", 2, 2)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    run = training_run(
+        staged,
+        checkpoint_path,
+        ANCHOR_FILE,
+        "--holdout-directory",
+        str(holdout),
+    )
+    before = [
+        parameter.detach().clone() for parameter in run.predictor.parameters()
+    ]
+
+    scalars = run.evaluate_holdout()
+
+    expected_targets = sum(
+        train.pipeline.eligible_count(path, True)
+        for path in sorted(holdout.glob("*.npz"))
+    )
+    assert scalars["holdout/targets"] == expected_targets
+    assert np.isfinite(scalars["holdout/loss_total"])
+    assert np.isfinite(scalars["holdout/ade_80step"])
+    after = list(run.predictor.parameters())
+    assert all(torch.equal(old, new) for old, new in zip(before, after))
+    assert run.predictor.training
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(FileNotFoundError, match="held-out"):
+        training_run(
+            staged,
+            checkpoint_path,
+            ANCHOR_FILE,
+            "--holdout-directory",
+            str(empty),
+        )
