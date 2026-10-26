@@ -60,7 +60,6 @@ class EpochPlan(NamedTuple):
 
     scenario_names_digest: str
     process_count: int
-    epochs_per_pass: int
     worker_count: int
     batch_size: int
     designated_only: bool
@@ -132,8 +131,6 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--prefetch", type=int, default=2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed-precision", action="store_true")
-    parser.add_argument("--all-eligible-agents", action="store_true")
-    parser.add_argument("--epochs-per-pass", type=int, default=1)
     return parser.parse_args()
 
 
@@ -245,6 +242,12 @@ class TrainingRun:
         if not path.exists():
             return 0, None
         checkpoint = load_checkpoint(path, self.device)
+        plan_record = checkpoint.get("epoch_plan") or {}
+        if not plan_record.get("designated_only", True):
+            raise ValueError(
+                f"{path} was trained on every eligible agent, not on the"
+                " designated targets; start a fresh run instead"
+            )
         model_state = checkpoint["model_state"]
         check_model_state(self.predictor, model_state, path)
         stored_anchors = model_state[ANCHORS_KEY].to(self.device)
@@ -262,14 +265,6 @@ class TrainingRun:
         stored = EpochPlan.stored(checkpoint.get("epoch_plan"))
         return completed, stored
 
-    def epoch_paths(self, epoch_index: int) -> list[Path]:
-        """This process's files for one epoch: one of --epochs-per-pass
-        disjoint slices, so one pass over every file takes that many epochs
-        and each epoch stays short enough to checkpoint and resume.
-        """
-        parts = self.arguments.epochs_per_pass
-        return self.paths[epoch_index % parts :: parts]
-
     def batch_settings(self, epoch_index: int) -> BatchSettings:
         arguments = self.arguments
         return BatchSettings(
@@ -277,7 +272,9 @@ class TrainingRun:
             worker_count=arguments.workers,
             prefetch_batches=arguments.prefetch,
             seed=arguments.seed + epoch_index,
-            designated_only=not arguments.all_eligible_agents,
+            # Waymo scores only its designated targets; most of the other
+            # agents stand still, so they would swamp the loss.
+            designated_only=True,
         )
 
     def plan_epochs(self, stored: EpochPlan | None) -> EpochPlan:
@@ -289,7 +286,6 @@ class TrainingRun:
         settings_now = (
             hashlib.sha256(names).hexdigest(),
             self.process_count,
-            self.arguments.epochs_per_pass,
             settings.worker_count,
             settings.batch_size,
             settings.designated_only,
@@ -297,15 +293,10 @@ class TrainingRun:
         if stored is not None and stored[:-1] == settings_now:
             print("optimiser step count read from the checkpoint")
             return stored
-        # Each process counts every slice of its own share of the files;
-        # every epoch then stops at the smallest count, so each epoch has
-        # the same steps and no process waits on another.
-        slice_counts = []
-        for part in range(self.arguments.epochs_per_pass):
-            part_paths = self.epoch_paths(part)
-            part_count = pipeline.steps_per_epoch(part_paths, settings)
-            slice_counts.append(part_count)
-        count = self.smallest(min(slice_counts))
+        # Each process counts its own share of the files; every process
+        # then stops at the smallest count, so none waits on another.
+        own_count = pipeline.steps_per_epoch(self.paths, settings)
+        count = self.smallest(own_count)
         epochs = self.arguments.epochs
         print(
             f"{count} optimiser steps per epoch,"
@@ -327,9 +318,14 @@ class TrainingRun:
         peak = arguments.learning_rate
         return Schedule(peak, arguments.warmup_steps, decay_start, decay_end)
 
-    def save(self, completed_epochs: int) -> None:
+    def save(self, completed_epochs: int, path: Path | None = None) -> None:
+        """Writes the checkpoint. The resume file is updated only when path
+        is omitted or is that file, so a sidecar cannot replace a finished
+        epoch.
+        """
         if not self.is_main:
             return
+        destination = path or self.arguments.checkpoint_path
         model_state = self.predictor.state_dict()
         state = {
             "model_state": model_state,
@@ -339,8 +335,10 @@ class TrainingRun:
             "code_version": layout.STAGING_CODE_VERSION,
             "epoch_plan": self.plan._asdict(),
         }
-        save_checkpoint(self.arguments.checkpoint_path, state)
-        self.saved_epochs = completed_epochs
+        save_checkpoint(destination, state)
+        updates_resume = destination == self.arguments.checkpoint_path
+        if updates_resume:
+            self.saved_epochs = completed_epochs
 
     def optimise(self, total: Tensor, rate: float) -> tuple[bool, bool]:
         """Sets this step's rate, then backward pass, gradient clip and
@@ -367,7 +365,9 @@ class TrainingRun:
         scale_before = self.scaler.get_scale()
         self.scaler.update()
         skipped = self.scaler.get_scale() < scale_before
-        return float(gradient_norm) > clip, skipped
+        # An infinite norm is larger than every clip; that step was skipped.
+        clipped = step_is_finite and float(gradient_norm) > clip
+        return clipped, skipped
 
     def train_epoch(self, batches: Batches, epoch_index: int) -> Scalars:
         """One pass over the data: forward and loss, the optimiser step and
@@ -402,7 +402,10 @@ class TrainingRun:
             seconds = time.perf_counter() - last_checkpoint
             if seconds >= self.arguments.checkpoint_every_seconds:
                 if loss_is_finite:
-                    self.save(epoch_index)
+                    recorded, destination = checkpoint_destination(
+                        self.arguments.checkpoint_path, epoch_index, False
+                    )
+                    self.save(recorded, destination)
                 last_checkpoint = time.perf_counter()
             # Every process stops at the same step count, so no process
             # waits for a gradient the others will never send.
@@ -441,8 +444,7 @@ class TrainingRun:
 
             epoch_start = time.perf_counter()
             settings = self.batch_settings(epoch_index)
-            epoch_paths = self.epoch_paths(epoch_index)
-            batches = pipeline.batches(epoch_paths, settings)
+            batches = pipeline.batches(self.paths, settings)
             scalars = self.train_epoch(batches, epoch_index)
             last_epoch_seconds = time.perf_counter() - epoch_start
             heading = f"epoch {epoch_index + 1}/{arguments.epochs}"
@@ -450,7 +452,10 @@ class TrainingRun:
 
             total = scalars["epoch/loss_total"]
             if math.isfinite(total):
-                self.save(epoch_index + 1)
+                recorded, destination = checkpoint_destination(
+                    self.arguments.checkpoint_path, epoch_index, True
+                )
+                self.save(recorded, destination)
             else:
                 print(
                     f"epoch {epoch_index + 1} mean total loss {total},"
@@ -466,6 +471,23 @@ class TrainingRun:
             f"done: {arguments.checkpoint_path} holds"
             f" {self.saved_epochs} epochs"
         )
+
+
+def epochs_recorded(epoch_index: int, finished: bool) -> int:
+    """The completed-epoch count a checkpoint write stores for this epoch."""
+    return epoch_index + int(finished)
+
+
+def checkpoint_destination(path: Path, epoch_index: int, finished: bool):
+    """The epoch count and file for this save. An unfinished epoch is a
+    sidecar, so it cannot replace the finished checkpoint.
+    """
+    recorded = epochs_recorded(epoch_index, finished)
+    if finished:
+        destination = path
+    else:
+        destination = path.with_suffix(path.suffix + ".periodic")
+    return recorded, destination
 
 
 # ------------------------------------------------------------------

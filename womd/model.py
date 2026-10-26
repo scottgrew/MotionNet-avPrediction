@@ -1,5 +1,5 @@
 """The network. Everything a predicted agent sees arrives in its own frame
-(womd/inputs.py): each agent's history and each map chunk become one token, a
+(womd/views.py): each agent's history and each map chunk become one token, a
 transformer encoder relates the tokens, and 54 anchor queries decode one
 future each through a transformer decoder.
 """
@@ -179,9 +179,7 @@ class ModeDecoder(nn.Module):
             nn.Linear(FEEDFORWARD_DIM, 1, bias=False),
         )
 
-    def decode(
-        self, queries: Tensor, anchors: Tensor, lines: Tensor
-    ) -> ModePredictions:
+    def decode(self, queries: Tensor, anchors: Tensor, lines: Tensor):
         """Trajectories and log sigmas (batch, modes, steps, 2) in metres and
         confidence logits (batch, modes) from one round's queries. lines is
         anchor_lines(anchors), built once per forward pass.

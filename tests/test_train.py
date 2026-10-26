@@ -288,6 +288,61 @@ def test_non_finite_step_changes_no_weight(tmp_path):
     assert all(torch.equal(old, new) for old, new in zip(before, after))
 
 
+def test_skipped_infinite_gradient_is_not_counted_as_clipped(tmp_path):
+    """An infinite gradient norm exceeds the clip, but a step the scaler
+    skips changed no weight and is not a clip.
+    """
+    staged = staged_copy(tmp_path / "staged", 0, 2)
+    run = training_run(staged, tmp_path / "checkpoint.pt")
+
+    class SkippingScaler:
+        """Stands in for a CUDA gradient scaler: enabled, and a skip is a
+        lowered scale with no optimiser step. This machine has no CUDA, so
+        the real scaler disables itself.
+        """
+
+        def __init__(self) -> None:
+            self.scale_value = 65536.0
+
+        def is_enabled(self) -> bool:
+            return True
+
+        def scale(self, loss):
+            return loss
+
+        def unscale_(self, _optimizer) -> None:
+            return None
+
+        def step(self, _optimizer) -> None:
+            return None
+
+        def get_scale(self) -> float:
+            return self.scale_value
+
+        def update(self) -> None:
+            self.scale_value *= 0.5
+
+    run.scaler = SkippingScaler()
+    before = [
+        parameter.detach().clone() for parameter in run.predictor.parameters()
+    ]
+    batch = synthetic_batch()
+    total = loss.loss_terms(run.predictor(batch)[-1], batch).total
+
+    def infinite_norm(_parameters, _clip, *_args, **_kwargs):
+        return torch.tensor(float("inf"))
+
+    patched_norm = unittest.mock.patch.object(
+        torch.nn.utils, "clip_grad_norm_", infinite_norm
+    )
+    with patched_norm:
+        clipped, skipped = run.optimise(total, rate=1e-3)
+
+    assert skipped and not clipped
+    after = list(run.predictor.parameters())
+    assert all(torch.equal(old, new) for old, new in zip(before, after))
+
+
 def test_resume_checks_what_it_resumes(tmp_path):
     """A resumed run refuses other anchors, recounts for other scenes and
     restores a checkpoint left only as its fallback.
@@ -319,6 +374,42 @@ def test_resume_checks_what_it_resumes(tmp_path):
     assert checkpoint_path.exists() and restored.completed_epochs == 1
 
 
+def test_periodic_save_leaves_the_finished_epoch(tmp_path):
+    """A save part way through an epoch goes to the sidecar, so the resume
+    file keeps the last finished epoch's weights and count.
+    """
+    staged = staged_copy(tmp_path / "staged", 0, 2)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    run = training_run(staged, checkpoint_path)
+    run.save(*train.checkpoint_destination(checkpoint_path, 0, True))
+    finished_bytes = checkpoint_path.read_bytes()
+
+    recorded, sidecar = train.checkpoint_destination(checkpoint_path, 1, False)
+    run.save(recorded, sidecar)
+
+    assert checkpoint_path.read_bytes() == finished_bytes
+    assert run.saved_epochs == 1
+    assert torch.load(sidecar)["completed_epochs"] == 1
+    recorded, destination = train.checkpoint_destination(
+        checkpoint_path, 1, True
+    )
+    assert (recorded, destination) == (2, checkpoint_path)
+
+
+def test_resume_refuses_weights_trained_on_every_agent(tmp_path):
+    """A checkpoint whose plan trained every eligible agent, most of them
+    standing still, is not resumed into a designated-target run.
+    """
+    staged = staged_copy(tmp_path / "staged", 0, 2)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    run = training_run(staged, checkpoint_path)
+    run.plan = run.plan._replace(designated_only=False)
+    run.save(1)
+
+    with pytest.raises(ValueError, match="every eligible agent"):
+        training_run(staged, checkpoint_path)
+
+
 def test_decay_from_the_first_epoch_starts_after_warm_up(tmp_path):
     """The cosine fall may not start before warm-up ends, or the rate drops
     from the peak in one step.
@@ -338,20 +429,24 @@ def test_decay_from_the_first_epoch_starts_after_warm_up(tmp_path):
     assert schedule.at(end_of_warm_up) == pytest.approx(peak)
 
 
-def test_epoch_slices_cover_every_file_once(tmp_path):
-    """One pass of --epochs-per-pass epochs trains on every file exactly
-    once.
-    """
-    staged = staged_copy(tmp_path / "staged", 0, 7)
-    run = training_run(
-        staged,
-        tmp_path / "checkpoint.pt",
-        ANCHOR_FILE,
-        "--epochs-per-pass",
-        "3",
+def test_every_epoch_is_a_full_pass(tmp_path):
+    """Each epoch trains on every one of the run's files."""
+    staged = staged_copy(tmp_path / "staged", 0, 3)
+    run = training_run(staged, tmp_path / "checkpoint.pt")
+    epoch_paths = []
+
+    def recorded_batches(paths, _settings):
+        epoch_paths.append(list(paths))
+        return []
+
+    finite_epoch = {"epoch/loss_total": 1.0}
+    patched_batches = unittest.mock.patch.object(
+        train.pipeline, "batches", recorded_batches
     )
-    slices = [run.epoch_paths(epoch_index) for epoch_index in range(3)]
-    covered = [path for part in slices for path in part]
-    assert sorted(covered) == sorted(run.paths)
-    assert len(covered) == len(set(covered))
-    assert run.epoch_paths(3) == slices[0]
+    patched_epoch = unittest.mock.patch.object(
+        run, "train_epoch", return_value=finite_epoch
+    )
+    with patched_batches, patched_epoch:
+        run.run()
+
+    assert epoch_paths == [run.paths, run.paths]

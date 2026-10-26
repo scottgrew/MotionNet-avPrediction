@@ -68,14 +68,11 @@ def gaussian_nll(predicted: ModePredictions, target: Tensor) -> Tensor:
     return per_axis.sum(dim=-1)
 
 
-def loss_terms(
-    predicted: ModePredictions,
-    targets: TargetInputs,
-    assigned_mode: Tensor | None = None,
-) -> LossTerms:
+def loss_terms(predicted: ModePredictions, targets, assigned_mode=None):
     """Combines the assigned anchor's Gaussian NLL with cross-entropy over
-    anchors, averaged only over samples with a valid future. The assignment
-    is computed here unless the caller already has it.
+    anchors for a TargetInputs batch, averaged only over samples with a
+    valid future. The assignment (batch,) is computed here unless the caller
+    already has it.
     """
     future = observed_future(targets)
     step_nll = gaussian_nll(predicted, future)

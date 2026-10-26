@@ -24,34 +24,34 @@ RANDOM_STATE_SEED = 0
 
 
 def reachable_endpoints(paths: list[Path]) -> tuple[Tensor, Tensor]:
-    """Every designated target's final valid future position (N, 2) in its
-    own frame, and its predicted type (N,). Endpoints further away than the
-    agent could have driven are left out; they stay training samples and
-    only do not shape the anchors.
+    """Every designated target's position at 8 s (N, 2) in its own frame,
+    and its predicted type (N,). An anchor is where an agent is at 8 s, so a
+    track that ends sooner is left out of the fit, as is an endpoint further
+    away than the agent could have driven; both stay training samples.
     """
     histories = []
     positions = []
+    ended_early = 0
     for path in paths:
         scenario = formats.StagedFile.load(path)
         eligible = views.eligible_tracks(scenario, designated_only=True)
         for track_index in eligible:
+            if not scenario.track_valid[track_index, -1]:
+                ended_early += 1
+                continue
             rows = scenario.track_rows[track_index]
             own_rows = frames.rows_to_frame(rows, frames.agent_frame(rows))
-            future_valid = scenario.track_valid[track_index, layout.FUTURE]
-            valid_steps = np.flatnonzero(future_valid)
-            if valid_steps.size == 0:
-                continue
-            future = own_rows[layout.FUTURE, layout.AGENT_POSITION]
             histories.append(own_rows[layout.HISTORY])
-            positions.append(future[valid_steps[-1]])
+            positions.append(own_rows[-1, layout.AGENT_POSITION])
     history = torch.from_numpy(np.stack(histories))
     endpoints = torch.from_numpy(np.stack(positions))
     type_index = model.predicted_type_index(history)
     reachable_metres = model.agent_reachable_distance(history)
     reachable = endpoints.norm(dim=-1) <= reachable_metres
     print(
-        f"{len(endpoints)} endpoints, {int((~reachable).sum())} beyond"
-        f" reachable distance left out of the fit"
+        f"{len(endpoints)} endpoints; {ended_early} tracks ending before 8 s"
+        f" and {int((~reachable).sum())} endpoints beyond reachable distance"
+        f" left out of the fit"
     )
     return endpoints[reachable], type_index[reachable]
 

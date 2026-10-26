@@ -361,6 +361,37 @@ def test_anchor_fitting_recovers_separated_clusters():
     assert int(counts.min()) > 0
 
 
+def test_anchor_endpoints_are_eight_second_positions(tmp_path):
+    """A track that ends before 8 s gives no endpoint, since an anchor is
+    where the agent is at 8 s; one that runs the full horizon gives its
+    position at the last step.
+    """
+    scenario = two_lane_signal_scenario(
+        2, np.zeros(layout.SIGNAL_HISTORY_SHAPE)
+    )
+    track_rows = scenario.track_rows.copy()
+    track_valid = scenario.track_valid.copy()
+    # Both vehicles drive along x at 10 m/s, one metre per step.
+    track_rows[:, :, layout.AGENT_TYPE.start] = 1.0
+    track_rows[:, :, layout.AGENT_POSITION.start] = np.arange(
+        layout.TOTAL_STEPS
+    )
+    track_rows[:, :, layout.AGENT_VELOCITY.start] = 10.0
+    track_valid[1, 50:] = False
+    path = tmp_path / "scene.npz"
+    scenario._replace(
+        track_rows=track_rows,
+        track_valid=track_valid,
+        provenance=formats.artifact_provenance("test", "endpoint test"),
+    ).save(path)
+
+    endpoints, type_index = fit_anchors.reachable_endpoints([path])
+
+    eight_seconds = float(layout.FUTURE_STEPS)
+    assert torch.allclose(endpoints, torch.tensor([[eight_seconds, 0.0]]))
+    assert type_index.tolist() == [0]
+
+
 def test_batched_pruning_matches_the_loop():
     """The plain single-sample loop is the reference."""
     torch.manual_seed(7)
