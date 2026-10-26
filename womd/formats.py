@@ -17,6 +17,7 @@ from numpy import ndarray
 
 from womd.frames import Frame
 from womd.layout import (
+    ANCHOR_FIT_VERSION,
     NUM_PREDICTED_MODES,
     STAGING_CODE_VERSION,
     SUBMISSION_FUTURE_INDICES,
@@ -33,6 +34,12 @@ def artifact_provenance(producer: str, source: Path | str) -> str:
         "source": str(source),
     }
     return json.dumps(stamp)
+
+
+def anchor_provenance(source: Path | str) -> str:
+    """fit_anchors.py's stamp, which also names the anchor fit version."""
+    stamp = json.loads(artifact_provenance("fit_anchors.py", source))
+    return json.dumps({**stamp, "anchor_fit": ANCHOR_FIT_VERSION})
 
 
 def check_provenance(stamp: Any, path: Path | str, hint: str) -> dict[str, str]:

@@ -571,6 +571,30 @@ def test_artifact_provenance_round_trips():
         formats.check_provenance(stale, "in-memory", "Regenerate.")
 
 
+def test_anchor_file_from_an_older_fit_is_refused(tmp_path):
+    """The staging code version cannot tell anchor fits apart, so an anchor
+    file also carries the fit version; one without it is refused.
+    """
+    anchor_shape = (layout.NUM_OBJECT_TYPES, model.QUERY_COUNT, 2)
+    anchors = np.zeros(anchor_shape, dtype=np.float32)
+    current = tmp_path / "current.npz"
+    np.savez(
+        current,
+        unit_anchors=anchors,
+        provenance=formats.anchor_provenance("unit-test-source"),
+    )
+    assert checkpoint.load_anchor_file(current).shape == anchor_shape
+
+    older = tmp_path / "older.npz"
+    np.savez(
+        older,
+        unit_anchors=anchors,
+        provenance=formats.artifact_provenance("fit_anchors.py", "y"),
+    )
+    with pytest.raises(ValueError, match=layout.ANCHOR_FIT_VERSION):
+        checkpoint.load_anchor_file(older)
+
+
 def write_scorer_scenario(path, scenario_id, agent_count):
     """A staged file of agent_count agents at x = 0, 1, 2, ... with no map."""
     track_rows = np.zeros(

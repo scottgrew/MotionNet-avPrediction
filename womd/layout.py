@@ -29,6 +29,10 @@ MAP_POINT_SPACING_METRES = 1.0
 MAP_CHUNK_DOTS = 20
 NUM_PREDICTED_MODES = 6
 STAGING_CODE_VERSION = "2026-08-19-a"
+# The anchor fit's own stamp, changed whenever fit_anchors.py would give
+# other anchors from the same staged files. 2026-10-26: designated targets
+# only, tracks ending before 8 s left out.
+ANCHOR_FIT_VERSION = "2026-10-26-8s-endpoints"
 
 # Waymo scores 16 of the 80 future steps, every fifth one, the
 # first being scenario step 15, future index 4.

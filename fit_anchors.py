@@ -105,9 +105,7 @@ def main() -> None:
         per_type_anchors.append(anchors)
 
     unit_anchors = torch.stack(per_type_anchors)
-    provenance = formats.artifact_provenance(
-        "fit_anchors.py", arguments.staged_directory
-    )
+    provenance = formats.anchor_provenance(arguments.staged_directory)
     np.savez(
         arguments.output_path,
         unit_anchors=unit_anchors.numpy().astype(np.float32),

@@ -73,7 +73,13 @@ def load_anchor_file(path: Path | str) -> torch.Tensor:
             anchors_file["provenance"] if "provenance" in stored else None
         )
         hint = "Refit them with fit_anchors.py."
-        formats.check_provenance(provenance, path, hint)
+        checked = formats.check_provenance(provenance, path, hint)
+        anchor_fit = checked.get("anchor_fit")
+        if anchor_fit != layout.ANCHOR_FIT_VERSION:
+            raise ValueError(
+                f"{path} is from anchor fit {anchor_fit!r}, this tree fits"
+                f" {layout.ANCHOR_FIT_VERSION!r}. {hint}"
+            )
         return torch.from_numpy(anchors_file["unit_anchors"])
 
 

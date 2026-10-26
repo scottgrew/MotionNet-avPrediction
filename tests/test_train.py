@@ -186,7 +186,7 @@ def test_kernel_command_line_parses(tmp_path):
     np.savez(
         anchors_path,
         unit_anchors=np.zeros(anchor_shape, dtype=np.float32),
-        provenance=formats.artifact_provenance("test", "kernel-interface-test"),
+        provenance=formats.anchor_provenance("kernel-interface-test"),
     )
     value_of_flag = {
         "--anchors": str(anchors_path),
@@ -229,7 +229,7 @@ def test_kernel_command_line_parses(tmp_path):
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 STAGED_DIRECTORY = REPOSITORY / "data" / "staged"
-ANCHOR_FILE = REPOSITORY / "data" / "training_anchors_54_sklearn.npz"
+ANCHOR_FILE = REPOSITORY / "data" / "training_anchors_54_8s.npz"
 
 
 def training_run(staged, checkpoint_path, anchors=ANCHOR_FILE, *extra):
