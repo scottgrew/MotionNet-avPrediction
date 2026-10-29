@@ -1,10 +1,11 @@
-"""Plain reference versions of the anchors and the pruning rule, kept only for
-the tests to compare against.
+"""Plain reference versions of the anchors, the pruning rule, and the loader's
+chunk selection and map transform, kept only for the tests to compare against.
 """
 
+import numpy as np
 import torch
 
-from womd import layout
+from womd import frames, layout, views
 from womd.model import QUERY_COUNT
 from womd.pruning import PRUNE_DISTANCE_METRES
 
@@ -69,3 +70,33 @@ def prune_modes_single_sample(trajectories, confidence_logits):
     )
     kept = torch.tensor(kept_indices, device=trajectories.device)
     return trajectories[kept], confidence_logits[kept]
+
+
+def nearest_chunks_full_sort(chunks, path):
+    """Every chunk's nearest dot to the path, all of them sorted; the bounded
+    search in womd/views.py must pick the same chunks in the same order.
+    """
+    positions = chunks.rows[..., layout.MAP_POSITION]
+    distances = views.segment_distance(positions - path.start, path.travel)
+    nearest_dot = np.where(chunks.dot_mask, distances, np.inf).min(axis=1)
+    return np.argsort(nearest_dot, kind="stable")[: views.CHUNK_SLOTS]
+
+
+def map_rows_to_frame_every_dot(rows, frame):
+    """Moves every dot's stop point and zeroes those that have none, the
+    original form of womd/frames.py's map_rows_to_frame.
+    """
+    moved = rows.copy()
+    moved[..., layout.MAP_POSITION] = frames.positions_to_frame(
+        rows[..., layout.MAP_POSITION], frame
+    )
+    moved[..., layout.MAP_DIRECTION] = frames.directions_to_frame(
+        rows[..., layout.MAP_DIRECTION], frame.heading
+    )
+    stop_points = rows[..., layout.MAP_STOP_POINT]
+    has_stop_point = (stop_points != 0.0).any(axis=-1, keepdims=True)
+    moved_stops = frames.positions_to_frame(stop_points, frame)
+    moved[..., layout.MAP_STOP_POINT] = np.where(
+        has_stop_point, moved_stops, 0.0
+    )
+    return moved

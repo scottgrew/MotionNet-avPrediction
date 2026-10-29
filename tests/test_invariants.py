@@ -290,6 +290,97 @@ def test_path_distance_matches_dense_sampling():
         assert np.allclose(closed_form, dense, atol=0.02)
 
 
+class SyntheticMap(NamedTuple):
+    """The three map fields views.scene_chunks reads."""
+
+    feature_lengths: np.ndarray
+    map_rows: np.ndarray
+    polyline_signal_histories: np.ndarray
+
+
+def one_dot_chunks(positions):
+    """One single-dot polyline, so one chunk, per position."""
+    rows = np.zeros((len(positions), layout.MAP_FEATURE_DIM), np.float32)
+    rows[:, layout.MAP_POSITION] = positions
+    lights = np.zeros((len(positions),) + layout.SIGNAL_HISTORY_SHAPE)
+    lengths = np.ones(len(positions), dtype=np.int64)
+    return views.scene_chunks(SyntheticMap(lengths, rows, lights))
+
+
+def test_bounded_chunk_search_matches_a_full_sort():
+    """Skipping chunks that cannot be among the nearest picks the same chunks
+    in the same order as sorting them all: for every designated target of
+    40 staged scenes, and for exact ties around a standing and a moving
+    target, where the stable order by chunk index must survive.
+    """
+    scenario_paths = sorted(STAGED_DIRECTORY.glob("*.npz"))[:40]
+    if not scenario_paths:
+        pytest.skip(f"no staged scenarios under {STAGED_DIRECTORY}")
+    for path in scenario_paths:
+        scenario = formats.StagedFile.load(path)
+        chunks = views.scene_chunks(scenario)
+        for target in views.designated_tracks(scenario):
+            now = scenario.track_rows[target, layout.CURRENT_STEP_INDEX]
+            velocity = now[layout.AGENT_VELOCITY]
+            travel = velocity * layout.FUTURE_HORIZON_SECONDS
+            scene_path = views.ScenePath(now[layout.AGENT_POSITION], travel)
+            expected = reference_implementations.nearest_chunks_full_sort(
+                chunks, scene_path
+            )
+            chosen = views.nearest_chunks(chunks, scene_path)
+            assert np.array_equal(chosen, expected), path.name
+
+    # 200 chunks on each of four points 10 m away, then 200 at 40 m: the
+    # cut at 256 falls inside a run of exact ties.
+    ring = [[10.0, 0.0], [0.0, 10.0], [-10.0, 0.0], [0.0, -10.0]]
+    positions = np.array(ring * 200 + [[40.0, 0.0]] * 200, np.float32)
+    shuffled = positions[np.random.default_rng(4).permutation(1000)]
+    chunks = one_dot_chunks(shuffled)
+    standing = np.zeros(2, np.float32)
+    for travel in (np.zeros(2, np.float32), np.array([0.0, 30.0], np.float32)):
+        scene_path = views.ScenePath(standing, travel)
+        expected = reference_implementations.nearest_chunks_full_sort(
+            chunks, scene_path
+        )
+        chosen = views.nearest_chunks(chunks, scene_path)
+        assert np.array_equal(chosen, expected)
+
+
+def test_moving_only_stop_points_matches_moving_every_dot():
+    """map_rows_to_frame moves only the dots that carry a stop point; the
+    rows must match moving every dot and zeroing the rest, byte for byte,
+    including a stop point stored as negative zero.
+    """
+    generator = np.random.default_rng(6)
+    rows = generator.normal(0.0, 50.0, (64, 20, layout.MAP_FEATURE_DIM))
+    rows = rows.astype(np.float32)
+    has_stop_point = generator.random((64, 20)) < 0.05
+    rows[~has_stop_point, layout.MAP_STOP_POINT] = 0.0
+    rows[0, 0, layout.MAP_STOP_POINT] = -0.0
+    rows[0, 1, layout.MAP_STOP_POINT] = [0.0, 3.0]
+    frame = Frame(np.array([12.5, -40.0], np.float32), 2.3)
+    moved = frames.map_rows_to_frame(rows, frame)
+    expected = reference_implementations.map_rows_to_frame_every_dot(
+        rows, frame
+    )
+    assert moved.dtype == expected.dtype
+    assert moved.tobytes() == expected.tobytes()
+
+
+def test_padding_matches_numpy_pad():
+    """padded fills to the slot count with zeros of the same dtype, and hands
+    back an array that already fills them unchanged.
+    """
+    history = np.arange(3 * 11 * 13, dtype=np.float32).reshape(3, 11, 13)
+    mask = np.ones((3, 11), dtype=bool)
+    for array in (history, mask):
+        widths = [(0, 5)] + [(0, 0)] * (array.ndim - 1)
+        padded = views.padded(array, 8)
+        assert padded.dtype == array.dtype
+        assert np.array_equal(padded, np.pad(array, widths))
+    assert views.padded(history, 3) is history
+
+
 def test_padded_slots_change_nothing():
     """Extra empty agent and chunk slots, and masked history steps and map
     dots, all holding NaN under their masks, must not move any prediction.

@@ -109,10 +109,12 @@ def map_rows_to_frame(rows: ndarray, frame: Frame) -> ndarray:
         rows[..., layout.MAP_DIRECTION], frame.heading
     )
     stop_points = rows[..., layout.MAP_STOP_POINT]
-    has_stop_point = (stop_points != 0.0).any(axis=-1, keepdims=True)
-    moved_stops = positions_to_frame(stop_points, frame)
-    moved[..., layout.MAP_STOP_POINT] = np.where(
-        has_stop_point, moved_stops, 0.0
+    # Two comparisons, because .any over the strided last axis is slower.
+    has_stop_point = (stop_points[..., 0] != 0.0) | (stop_points[..., 1] != 0.0)
+    # Few dots carry a stop point, so only theirs are moved.
+    moved[..., layout.MAP_STOP_POINT] = 0.0
+    moved[has_stop_point, layout.MAP_STOP_POINT] = positions_to_frame(
+        stop_points[has_stop_point], frame
     )
     return moved
 

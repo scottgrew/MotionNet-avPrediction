@@ -22,6 +22,10 @@ from womd.layout import FUTURE, HISTORY
 # Chosen by Scott 2026-10-19 from their measured exclusions.
 AGENT_SLOTS = 48
 CHUNK_SLOTS = 256
+# Kept on the chunk bounds in nearest_chunks so that float32 rounding in the
+# exact distances, about 3e-5 m at 300 m, can never drop a chunk the full
+# sort would keep.
+BOUND_SLACK_METRES = 0.01
 
 
 TrackSource = Union[StagedFile, TrackArrays]
@@ -66,6 +70,13 @@ class SceneChunks(NamedTuple):
     rows: ndarray  # (C, 20, 32)
     dot_mask: ndarray  # (C, 20) False for padding
     signal_history: ndarray  # (C, 11, 9) the chunk's polyline's lights
+    # The rows' position columns, copied out once per scene because every
+    # target measures its distance to them.
+    dot_positions: ndarray  # (C, 20, 2)
+    # Each chunk's mean dot and its farthest dot's distance from it, which
+    # bound how near any of its dots can be (nearest_chunks).
+    centres: ndarray  # (C, 2) float64
+    radii: ndarray  # (C,) float64
 
 
 class TargetInputs(NamedTuple):
@@ -113,27 +124,60 @@ def scene_chunks(scenario: StagedFile) -> SceneChunks:
     dot_mask[dot_chunk, dot_slot] = True
     chunk_polyline = np.repeat(np.arange(len(lengths)), chunks_per_polyline)
     signals = scenario.polyline_signal_histories[chunk_polyline]
-    return SceneChunks(rows, dot_mask, signals)
+    positions = np.ascontiguousarray(rows[..., layout.MAP_POSITION])
+    # Padding dots sit at zero, so summing every slot sums the real dots.
+    # The bound holds around whatever centre the radius is measured from,
+    # so float32 is precise enough.
+    dot_counts = dot_mask.sum(axis=1, dtype=np.float32)[:, None]
+    centres = positions.sum(axis=1) / dot_counts
+    spread_x = positions[..., 0] - centres[:, 0, None]
+    spread_y = positions[..., 1] - centres[:, 1, None]
+    spread_squared = spread_x * spread_x + spread_y * spread_y
+    radii = np.sqrt(np.where(dot_mask, spread_squared, 0.0).max(axis=1))
+    return SceneChunks(
+        rows,
+        dot_mask,
+        signals,
+        positions,
+        centres.astype(np.float64),
+        radii.astype(np.float64),
+    )
+
+
+def segment_distance_squared(points: ndarray, path_end: ndarray) -> ndarray:
+    """Squared distance from each point (..., 2) to the segment from the
+    origin to path_end (2,).
+    """
+    # The nearest point on the segment is t * path_end with t the projection
+    # p . e / e . e, clipped to [0, 1].
+    length_squared = float(path_end @ path_end)
+    gap = points
+    if length_squared != 0.0:
+        fraction = np.clip(points @ path_end / length_squared, 0.0, 1.0)
+        gap = points - fraction[..., None] * path_end
+    # The squares summed as np.linalg.norm sums them, so a square root of
+    # this is its distance to the last bit.
+    return np.add.reduce(gap * gap, axis=-1)
 
 
 def segment_distance(points: ndarray, path_end: ndarray) -> ndarray:
     """Distance from each point (..., 2) to the segment from the origin to
     path_end (2,).
     """
-    # The nearest point on the segment is t * path_end with t the projection
-    # p . e / e . e, clipped to [0, 1].
-    length_squared = float(path_end @ path_end)
-    if length_squared == 0.0:
-        return np.linalg.norm(points, axis=-1)
-    fraction = np.clip(points @ path_end / length_squared, 0.0, 1.0)
-    nearest = fraction[..., None] * path_end
-    return np.linalg.norm(points - nearest, axis=-1)
+    return np.sqrt(segment_distance_squared(points, path_end))
 
 
 def padded(array: ndarray, length: int) -> ndarray:
-    """Zero-pads the first axis of array to length."""
-    widths = [(0, length - len(array))] + [(0, 0)] * (array.ndim - 1)
-    return np.pad(array, widths)
+    """Zero-pads the first axis of array to length; an array already that
+    long comes back as it is.
+    """
+    if len(array) == length:
+        return array
+    # Filling a zero block is several times faster than np.pad, which the
+    # loader called five times per target.
+    block = np.zeros((length,) + array.shape[1:], dtype=array.dtype)
+    block[: len(array)] = array
+    return block
 
 
 def last_valid_positions(history: ndarray, valid: ndarray) -> ndarray:
@@ -175,10 +219,38 @@ def nearest_chunks(chunks: SceneChunks, path: ScenePath) -> ndarray:
     """Up to CHUNK_SLOTS chunk indices, nearest first by each chunk's nearest
     dot to the target's path.
     """
-    scene_positions = chunks.rows[..., layout.MAP_POSITION]
-    distances = segment_distance(scene_positions - path.start, path.travel)
-    nearest_dot = np.where(chunks.dot_mask, distances, np.inf).min(axis=1)
-    return np.argsort(nearest_dot, kind="stable")[:CHUNK_SLOTS]
+    candidates = chunks_that_can_be_nearest(chunks, path)
+    offsets = chunks.dot_positions[candidates] - path.start
+    squared = segment_distance_squared(offsets, path.travel)
+    dot_mask = chunks.dot_mask[candidates]
+    nearest_squared = np.where(dot_mask, squared, np.inf).min(axis=1)
+    # The square root never decreases, so the root of each chunk's smallest
+    # square is its nearest dot's distance exactly, at one root per chunk
+    # instead of one per dot.
+    nearest_dot = np.sqrt(nearest_squared)
+    # Candidates are in index order, so a stable sort breaks ties by chunk
+    # index exactly as sorting every chunk would.
+    order = np.argsort(nearest_dot, kind="stable")[:CHUNK_SLOTS]
+    return candidates[order]
+
+
+def chunks_that_can_be_nearest(chunks: SceneChunks, path: ScenePath):
+    """Indices, in increasing order, of every chunk that can be among the
+    CHUNK_SLOTS nearest to the path. A chunk's dots are no nearer than its
+    centre's distance minus its radius and no farther than plus it, so a
+    chunk whose nearest bound is beyond the CHUNK_SLOTS-th smallest farthest
+    bound has at least CHUNK_SLOTS chunks strictly nearer.
+    """
+    chunk_count = len(chunks.radii)
+    if chunk_count <= CHUNK_SLOTS:
+        return np.arange(chunk_count)
+    start = path.start.astype(np.float64)
+    travel = path.travel.astype(np.float64)
+    centre_distance = segment_distance(chunks.centres - start, travel)
+    farthest = centre_distance + chunks.radii
+    cutoff = np.partition(farthest, CHUNK_SLOTS - 1)[CHUNK_SLOTS - 1]
+    nearest = centre_distance - chunks.radii
+    return np.flatnonzero(nearest <= cutoff + BOUND_SLACK_METRES)
 
 
 def target_inputs(scenario, chunks: SceneChunks, target: int) -> TargetInputs:
