@@ -5,6 +5,7 @@ and the Kaggle kernel's command line.
 import ast
 import contextlib
 import io
+import math
 import unittest.mock
 from pathlib import Path
 
@@ -472,7 +473,7 @@ def test_holdout_scores_every_designated_target_and_trains_nothing(tmp_path):
         parameter.detach().clone() for parameter in run.predictor.parameters()
     ]
 
-    scalars = run.evaluate_holdout()
+    scalars, by_type = run.evaluate_holdout()
 
     expected_targets = sum(
         train.pipeline.eligible_count(path, True)
@@ -481,6 +482,18 @@ def test_holdout_scores_every_designated_target_and_trains_nothing(tmp_path):
     assert scalars["holdout/targets"] == expected_targets
     assert np.isfinite(scalars["holdout/loss_total"])
     assert np.isfinite(scalars["holdout/ade_80step"])
+    # Every target is counted under exactly one type, and the types'
+    # 8 s minADE, weighted by their targets, is the pooled 80-step one.
+    type_names = ("vehicle", "pedestrian", "cyclist")
+    counts = [by_type[f"holdout_{name}/targets"] for name in type_names]
+    assert sum(counts) == expected_targets
+    weighted = sum(
+        count * by_type[f"holdout_{name}/ade_8s"]
+        for name, count in zip(type_names, counts)
+        if count
+    )
+    pooled = weighted / expected_targets
+    assert pooled == pytest.approx(scalars["holdout/ade_80step"], rel=1e-5)
     after = list(run.predictor.parameters())
     assert all(torch.equal(old, new) for old, new in zip(before, after))
     assert run.predictor.training
@@ -495,3 +508,185 @@ def test_holdout_scores_every_designated_target_and_trains_nothing(tmp_path):
             "--holdout-directory",
             str(empty),
         )
+
+
+# Run 41's held-out minADE over its ten flat epochs at 2e-4.
+RUN_41_FLAT_ADE = (
+    1.904,
+    1.674,
+    1.659,
+    1.523,
+    1.578,
+    1.503,
+    1.447,
+    1.438,
+    1.427,
+    1.430,
+)
+
+
+def replay(rule, ade_by_epoch):
+    """The plateau state after each epoch of a sequence of held-out ADEs."""
+    state = train.PlateauState.fresh()
+    states = []
+    for epoch, ade in enumerate(ade_by_epoch, start=1):
+        state = rule.after_epoch(state, epoch, ade)
+        states.append(state)
+    return states
+
+
+def test_plateau_survives_one_noisy_epoch_then_ends_the_flat_phase():
+    """Replaying run 41: the bump at epoch 5 and the 9 mm step at epoch 8
+    must not end the flat phase; two epochs without a 1 cm gain after epoch
+    6 do. A stall before the minimum flat epochs is ignored, and the
+    maximum ends the phase whatever the held-out numbers do.
+    """
+    rule = train.PlateauRule(
+        patience=2, min_improvement=0.01, min_flat_epochs=6, max_flat_epochs=14
+    )
+    states = replay(rule, RUN_41_FLAT_ADE)
+    assert all(state.flat_epochs is None for state in states)
+    assert states[-1].best_ade == pytest.approx(1.427)
+
+    ended = replay(rule, RUN_41_FLAT_ADE + (1.429,))[-1]
+    assert ended.flat_epochs == 11
+
+    early_stall = replay(rule, (2.0, 2.0, 2.0, 2.0, 2.0, 2.0))
+    assert [state.flat_epochs for state in early_stall] == [None] * 5 + [6]
+
+    still_improving = replay(rule, [2.0 - 0.05 * epoch for epoch in range(14)])
+    assert still_improving[-1].flat_epochs == 14
+    assert still_improving[-2].flat_epochs is None
+
+    unmeasured = replay(rule, (2.0,) * 5 + (math.nan,))
+    assert unmeasured[-1].flat_epochs == 6
+
+    # 6 mm a epoch is a counted 1 cm every second epoch, so a slow but
+    # steady gain holds the rate until the maximum.
+    slow = replay(rule, [2.0 - 0.006 * epoch for epoch in range(14)])
+    assert [state.flat_epochs for state in slow] == [None] * 13 + [14]
+
+
+def plateau_run(staged, checkpoint_path, holdout, *extra):
+    return training_run(
+        staged,
+        checkpoint_path,
+        ANCHOR_FILE,
+        "--epochs",
+        "6",
+        "--holdout-directory",
+        str(holdout),
+        "--decay-on-plateau",
+        "--decay-epochs",
+        "2",
+        "--plateau-patience",
+        "1",
+        "--plateau-min-improvement",
+        "0.01",
+        "--min-flat-epochs",
+        "2",
+        *extra,
+    )
+
+
+def scripted_run(run, ade_by_epoch):
+    """Runs run with each epoch's training replaced by a finite loss and
+    each held-out pass by the next scripted ADE; returns the epochs run.
+    """
+    finished = []
+
+    def epoch(_batches, epoch_index):
+        finished.append(epoch_index + 1)
+        return {"epoch/loss_total": 1.0}
+
+    scores = iter(ade_by_epoch)
+
+    def holdout():
+        overall = {"holdout/ade_80step": next(scores)}
+        return train.HoldoutScores(overall, {})
+
+    patched_batches = unittest.mock.patch.object(
+        train.pipeline, "batches", lambda *_: []
+    )
+    patched_epoch = unittest.mock.patch.object(
+        run, "train_epoch", side_effect=epoch
+    )
+    patched_holdout = unittest.mock.patch.object(
+        run, "evaluate_holdout", holdout
+    )
+    with patched_batches, patched_epoch, patched_holdout:
+        run.run()
+    return finished
+
+
+def test_plateau_run_stops_at_the_trigger_and_resumes_into_the_fall(tmp_path):
+    """A session ends when the flat phase does, leaving the checkpoint and a
+    branch copy of it; the resumed session runs only the fall, whose rate
+    holds at the peak through the flat epochs and reaches zero on its last
+    step.
+    """
+    staged = staged_copy(tmp_path / "staged", 0, 2)
+    holdout = staged_copy(tmp_path / "holdout", 2, 1)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+
+    first = plateau_run(staged, checkpoint_path, holdout)
+    assert scripted_run(first, [2.0, 2.0, 2.0]) == [1, 2]
+    branch = train.branch_path(checkpoint_path)
+    stored = torch.load(branch, weights_only=False)
+    assert stored["completed_epochs"] == 2
+    assert stored["plateau"]["flat_epochs"] == 2
+
+    second = plateau_run(staged, checkpoint_path, holdout)
+    assert scripted_run(second, [1.9, 1.8]) == [3, 4]
+    steps = second.plan.steps_per_epoch
+    peak = second.arguments.learning_rate
+    assert second.schedule.at(2 * steps - 1) == pytest.approx(peak)
+    assert second.schedule.at(4 * steps - 1) == pytest.approx(0.0)
+    assert (
+        torch.load(checkpoint_path, weights_only=False)["completed_epochs"] == 4
+    )
+
+
+def test_plateau_recipe_is_checked(tmp_path):
+    """The plateau needs a held-out directory and excludes a fixed decay
+    epoch; a resumed fall may not change its length, while a branch copy
+    resumed before the fall may.
+    """
+    staged = staged_copy(tmp_path / "staged", 0, 2)
+    holdout = staged_copy(tmp_path / "holdout", 2, 1)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    with pytest.raises(ValueError, match="holdout"):
+        training_run(
+            staged,
+            checkpoint_path,
+            ANCHOR_FILE,
+            "--decay-on-plateau",
+            "--decay-epochs",
+            "2",
+            "--plateau-patience",
+            "1",
+            "--plateau-min-improvement",
+            "0.01",
+            "--min-flat-epochs",
+            "2",
+        )
+    with pytest.raises(ValueError, match="decay-from-epoch"):
+        plateau_run(staged, checkpoint_path, holdout, "--decay-from-epoch", "3")
+
+    scripted_run(plateau_run(staged, checkpoint_path, holdout), [2.0, 2.0])
+    branch = train.branch_path(checkpoint_path)
+    branch_copy = tmp_path / "branch.pt"
+    branch_copy.write_bytes(branch.read_bytes())
+    longer = plateau_run(staged, branch_copy, holdout, "--decay-epochs", "3")
+    assert scripted_run(longer, [1.9, 1.8, 1.7]) == [3, 4, 5]
+    steps = longer.plan.steps_per_epoch
+    assert longer.schedule.at(5 * steps - 1) == pytest.approx(0.0)
+
+    # One epoch into a two-epoch fall, its length is fixed.
+    mid_fall = torch.load(branch, weights_only=False)
+    mid_fall["completed_epochs"] = 3
+    mid_fall["plateau"]["fall_epochs"] = 2
+    mid_fall_path = tmp_path / "mid_fall.pt"
+    torch.save(mid_fall, mid_fall_path)
+    with pytest.raises(ValueError, match="decay-epochs"):
+        plateau_run(staged, mid_fall_path, holdout, "--decay-epochs", "4")

@@ -1320,6 +1320,47 @@ def test_pruning_fills_six_slots_from_three_modes():
     assert torch.all(submitted.confidences[0, 3:] == 0.0)
 
 
+def test_errors_split_by_type_and_horizon():
+    """A vehicle, a pedestrian and a cyclist whose best kept mode sits 1, 2
+    and 3 m off their logged future score those errors at every horizon;
+    the pedestrian's future ends after 3 s, so its 5 s and 8 s final errors
+    are unmeasured, and the 8 s numbers pooled over types are the monitor's.
+    """
+    size = SyntheticSize(samples=3, agents=2, polylines=1, dots_per_polyline=2)
+    batch = synthetic_inputs(size)
+    batch.future_positions.zero_()
+    batch.future_mask[1, 30:] = False
+    kept = torch.full(
+        (3, layout.NUM_PREDICTED_MODES, layout.FUTURE_STEPS, 2), 50.0
+    )
+    for sample, offset in enumerate((1.0, 2.0, 3.0)):
+        kept[sample, 0] = torch.tensor([offset, 0.0])
+
+    errors = metrics.TypeHorizonErrors()
+    errors.add(kept, batch)
+    scalars = errors.scalars("holdout_")
+
+    for name, offset in (
+        ("vehicle", 1.0),
+        ("pedestrian", 2.0),
+        ("cyclist", 3.0),
+    ):
+        assert scalars[f"holdout_{name}/targets"] == 1
+        for horizon in ("3s", "5s", "8s"):
+            assert scalars[f"holdout_{name}/ade_{horizon}"] == pytest.approx(
+                offset
+            )
+    assert scalars["holdout_pedestrian/fde_3s"] == pytest.approx(2.0)
+    assert math.isnan(scalars["holdout_pedestrian/fde_5s"])
+    assert math.isnan(scalars["holdout_pedestrian/fde_8s"])
+    assert scalars["holdout_cyclist/fde_8s"] == pytest.approx(3.0)
+
+    progress = metrics.EpochProgress(torch.device("cpu"))
+    progress.add_pruned_errors(kept, batch)
+    pooled = float(progress.ade_sum / progress.ade_count)
+    assert errors.pooled_ade("8s") == pytest.approx(pooled)
+
+
 def test_broken_submission_is_refused(tmp_path):
     """A submission row the scorer would misread must fail on save."""
     slots = layout.NUM_PREDICTED_MODES

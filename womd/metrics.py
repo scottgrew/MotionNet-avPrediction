@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from womd import layout
 from womd.loss import LossTerms, mean_over_valid_steps
 from womd.model import QUERY_COUNT, ModePredictions
 from womd.pruning import prune_modes
@@ -21,6 +22,11 @@ from womd.views import TargetInputs
 # A log line is printed once per this many batches, and the pruned
 # minADE and minFDE run on that batch only, because pruning is slow.
 LOG_EVERY_BATCHES = 20
+
+# Waymo's three scoring horizons, as counts of 10 Hz future steps, and the
+# predicted types in their one-hot order (layout.PREDICTED_OBJECT_TYPES).
+HORIZON_STEPS = (("3s", 30), ("5s", 50), ("8s", 80))
+TYPE_NAMES = ("vehicle", "pedestrian", "cyclist")
 
 Scalars = dict[str, float]
 
@@ -96,9 +102,13 @@ class EpochProgress:
     def add_kept_mode_errors(self, predicted: ModePredictions, targets):
         logits = predicted.confidence_logits
         pruned = prune_modes(predicted.trajectories, logits)
+        self.add_pruned_errors(pruned.trajectories, targets)
+
+    def add_pruned_errors(self, kept: Tensor, targets: TargetInputs) -> None:
+        """Adds minADE and minFDE over modes already pruned to the 6 kept."""
         logged = targets.future_positions.unsqueeze(1)
-        distances = (pruned.trajectories - logged).norm(dim=-1)
-        average_distances = mode_distances(pruned.trajectories, targets)
+        distances = (kept - logged).norm(dim=-1)
+        average_distances = mode_distances(kept, targets)
 
         has_valid_step = targets.future_mask.any(dim=-1)
         best_average = average_distances.min(dim=-1).values
@@ -153,3 +163,77 @@ class EpochProgress:
             **self.health_scalars(),
             "epoch/seconds": time.perf_counter() - self.start,
         }
+
+
+def target_types(targets: TargetInputs) -> Tensor:
+    """Each target's object type index, from the type one-hot of its own row
+    (agent slot 0) at the current step.
+    """
+    now = targets.agent_history[:, 0, layout.CURRENT_STEP_INDEX]
+    type_one_hot = now[:, layout.AGENT_TYPE][:, : layout.NUM_OBJECT_TYPES]
+    return type_one_hot.argmax(dim=-1)
+
+
+class TypeHorizonErrors:
+    """minADE and minFDE over the 6 kept modes for each object type at Waymo's
+    3, 5 and 8 s horizons, summed over a pass, so a type falling behind
+    shows during training. Averages are over each horizon's valid steps, as
+    the monitor's 80-step numbers are.
+    """
+
+    def __init__(self) -> None:
+        shape = (layout.NUM_OBJECT_TYPES, len(HORIZON_STEPS))
+        self.ade_sum = np.zeros(shape)
+        self.ade_count = np.zeros(shape)
+        self.fde_sum = np.zeros(shape)
+        self.fde_count = np.zeros(shape)
+        self.target_count = np.zeros(layout.NUM_OBJECT_TYPES)
+
+    def add(self, kept: Tensor, targets: TargetInputs) -> None:
+        """Folds in one batch's kept modes (B, 6, 80, 2)."""
+        type_index = target_types(targets)
+        by_type = torch.nn.functional.one_hot(
+            type_index, layout.NUM_OBJECT_TYPES
+        ).T.double()
+        self.target_count += by_type.sum(dim=1).cpu().numpy()
+        logged = targets.future_positions.unsqueeze(1)
+        gaps = (kept - logged).norm(dim=-1)
+        for column, (_, steps) in enumerate(HORIZON_STEPS):
+            mask = targets.future_mask[:, :steps]
+            average = mean_over_valid_steps(gaps[..., :steps], mask)
+            best_average = average.min(dim=-1).values.double()
+            has_valid_step = mask.any(dim=-1).double()
+            best_final = gaps[:, :, steps - 1].min(dim=-1).values.double()
+            final_valid = mask[:, -1].double()
+            sums = [
+                by_type @ (best_average * has_valid_step),
+                by_type @ has_valid_step,
+                by_type @ (best_final * final_valid),
+                by_type @ final_valid,
+            ]
+            ade_sum, ade_count, fde_sum, fde_count = (
+                total.cpu().numpy() for total in sums
+            )
+            self.ade_sum[:, column] += ade_sum
+            self.ade_count[:, column] += ade_count
+            self.fde_sum[:, column] += fde_sum
+            self.fde_count[:, column] += fde_count
+
+    def pooled_ade(self, horizon: str) -> float:
+        """minADE at one horizon over every type together."""
+        column = [label for label, _ in HORIZON_STEPS].index(horizon)
+        total = self.ade_sum[:, column].sum()
+        return mean_or_nan(total, self.ade_count[:, column].sum())
+
+    def scalars(self, prefix: str) -> Scalars:
+        """One table per type, e.g. prefix + "vehicle/ade_3s"."""
+        table = {}
+        for row, type_name in enumerate(TYPE_NAMES):
+            group = f"{prefix}{type_name}/"
+            table[group + "targets"] = int(self.target_count[row])
+            for column, (label, _) in enumerate(HORIZON_STEPS):
+                ade = self.ade_sum[row, column], self.ade_count[row, column]
+                fde = self.fde_sum[row, column], self.fde_count[row, column]
+                table[f"{group}ade_{label}"] = mean_or_nan(*ade)
+                table[f"{group}fde_{label}"] = mean_or_nan(*fde)
+        return table

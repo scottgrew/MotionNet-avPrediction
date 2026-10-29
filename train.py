@@ -37,9 +37,16 @@ from womd.checkpoint import (
     previous_path,
     save_checkpoint,
 )
-from womd.metrics import LOG_EVERY_BATCHES, EpochProgress, Scalars, mean_or_nan
+from womd.metrics import (
+    LOG_EVERY_BATCHES,
+    EpochProgress,
+    Scalars,
+    TypeHorizonErrors,
+    mean_or_nan,
+)
 from womd.model import MotionPredictor
 from womd.pipeline import BatchSettings
+from womd.pruning import prune_modes
 from womd.views import TargetInputs
 
 # The peak learning rate unless --learning-rate sets another, and
@@ -50,6 +57,13 @@ SECONDS_PER_HOUR = 3600
 STACK_DUMP_SECONDS = 1800
 
 Batches = Iterable[TargetInputs]
+
+
+class HoldoutScores(NamedTuple):
+    """The held-out pass's pooled table and its per-type, per-horizon one."""
+
+    overall: Scalars
+    by_type: Scalars
 
 
 class EpochPlan(NamedTuple):
@@ -97,6 +111,52 @@ class Schedule(NamedTuple):
         return self.peak * 0.5 * (1.0 + math.cos(math.pi * fraction))
 
 
+class PlateauState(NamedTuple):
+    """Where the flat phase stands, stored in the checkpoint so a resumed
+    session carries on the same count. flat_epochs is set when the phase
+    ends, fall_epochs once the fall has begun, after which its length is
+    fixed.
+    """
+
+    best_ade: float
+    epochs_without_improvement: int
+    flat_epochs: int | None
+    fall_epochs: int | None
+
+    @classmethod
+    def fresh(cls) -> PlateauState:
+        return cls(math.inf, 0, None, None)
+
+
+class PlateauRule(NamedTuple):
+    """Ends the flat phase after an epoch once held-out minADE has gone
+    patience epochs without beating its best by min_improvement metres,
+    never before min_flat_epochs and always at max_flat_epochs. The best
+    moves only on a counted improvement, so neither a noisy bump nor a run
+    of tiny gains restarts the wait.
+    """
+
+    patience: int
+    min_improvement: float
+    min_flat_epochs: int
+    max_flat_epochs: int
+
+    def after_epoch(self, state: PlateauState, epoch: int, ade: float):
+        """The state after 1-based epoch scored held-out minADE ade."""
+        if state.flat_epochs is not None:
+            return state
+        # A NaN compares false, so an unmeasured epoch counts as no gain.
+        improved = ade <= state.best_ade - self.min_improvement
+        waiting = 0 if improved else state.epochs_without_improvement + 1
+        stalled = waiting >= self.patience and epoch >= self.min_flat_epochs
+        ends = stalled or epoch >= self.max_flat_epochs
+        return state._replace(
+            best_ade=ade if improved else state.best_ade,
+            epochs_without_improvement=waiting,
+            flat_epochs=epoch if ends else None,
+        )
+
+
 def parameter_groups(predictor: nn.Module) -> list[dict[str, Any]]:
     """Splits parameters so weight decay applies to matrices only, not to
     biases or norms.
@@ -132,7 +192,61 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mixed-precision", action="store_true")
     parser.add_argument("--holdout-directory", type=Path, default=None)
+    # Instead of --decay-from-epoch: hold the rate until held-out minADE
+    # stalls (PlateauRule), end the session there, and fall over
+    # --decay-epochs when resumed. --epochs is then the most the run takes.
+    parser.add_argument("--decay-on-plateau", action="store_true")
+    parser.add_argument("--decay-epochs", type=int, default=None)
+    parser.add_argument("--plateau-patience", type=int, default=None)
+    parser.add_argument("--plateau-min-improvement", type=float, default=None)
+    parser.add_argument("--min-flat-epochs", type=int, default=None)
     return parser.parse_args()
+
+
+PLATEAU_OPTIONS = (
+    "decay_epochs",
+    "plateau_patience",
+    "plateau_min_improvement",
+    "min_flat_epochs",
+)
+
+
+def plateau_rule(arguments: argparse.Namespace) -> PlateauRule | None:
+    """The rule --decay-on-plateau asks for, every one of its settings
+    stated; None without it.
+    """
+    if not arguments.decay_on_plateau:
+        return None
+    if arguments.holdout_directory is None:
+        raise ValueError(
+            "--decay-on-plateau reads held-out minADE: give"
+            " --holdout-directory"
+        )
+    if arguments.decay_from_epoch is not None:
+        raise ValueError(
+            "--decay-on-plateau decides where the fall starts; drop"
+            " --decay-from-epoch"
+        )
+    missing = [
+        "--" + name.replace("_", "-")
+        for name in PLATEAU_OPTIONS
+        if getattr(arguments, name) is None
+    ]
+    if missing:
+        raise ValueError(f"--decay-on-plateau needs {', '.join(missing)}")
+    max_flat_epochs = arguments.epochs - arguments.decay_epochs
+    if max_flat_epochs < arguments.min_flat_epochs:
+        raise ValueError(
+            f"--epochs {arguments.epochs} leaves {max_flat_epochs} flat"
+            f" epochs before a {arguments.decay_epochs}-epoch fall, fewer"
+            f" than --min-flat-epochs {arguments.min_flat_epochs}"
+        )
+    return PlateauRule(
+        patience=arguments.plateau_patience,
+        min_improvement=arguments.plateau_min_improvement,
+        min_flat_epochs=arguments.min_flat_epochs,
+        max_flat_epochs=max_flat_epochs,
+    )
 
 
 class TrainingRun:
@@ -177,8 +291,15 @@ class TrainingRun:
         self.optimizer = torch.optim.AdamW(groups, lr=arguments.learning_rate)
         scaling = arguments.mixed_precision and self.device.type == "cuda"
         self.scaler = GradScaler(enabled=scaling)
-        self.completed_epochs, stored_plan = self.resume()
+        self.rule = plateau_rule(arguments)
+        if self.rule is not None and self.process_count > 1:
+            raise ValueError(
+                "--decay-on-plateau reads held-out scores, which only the"
+                " main process computes; train on one process"
+            )
+        self.completed_epochs, stored_plan, stored_plateau = self.resume()
         self.saved_epochs = self.completed_epochs
+        self.plateau = self.restore_plateau(stored_plateau)
 
         self.all_paths = sorted(arguments.staged_directory.glob("*.npz"))
         if not self.all_paths:
@@ -204,10 +325,11 @@ class TrainingRun:
             raise FileNotFoundError(f"no .npz held-out scenes in {directory}")
         return paths
 
-    def evaluate_holdout(self) -> Scalars:
+    def evaluate_holdout(self) -> HoldoutScores:
         """Loss, and minADE and minFDE over the 6 kept modes, for every
         designated target in --holdout-directory, scenes training never
-        sees. Runs in float32 and changes no weight.
+        sees, pooled and then per object type at 3, 5 and 8 s. Runs in
+        float32 and changes no weight.
         """
         settings = BatchSettings(
             batch_size=self.arguments.batch_size,
@@ -217,6 +339,7 @@ class TrainingRun:
             designated_only=True,
         )
         progress = EpochProgress(self.device)
+        by_type = TypeHorizonErrors()
         self.predictor.eval()
         with torch.no_grad():
             for host_batch in pipeline.batches(self.holdout_paths, settings):
@@ -226,9 +349,14 @@ class TrainingRun:
                     loss.round_loss_terms(rounds, batch), False, False
                 )
                 progress.sample_count += batch.agent_history.shape[0]
-                progress.add_kept_mode_errors(rounds[-1], batch)
+                final = rounds[-1]
+                kept = prune_modes(
+                    final.trajectories, final.confidence_logits
+                ).trajectories
+                progress.add_pruned_errors(kept, batch)
+                by_type.add(kept, batch)
         self.predictor.train()
-        return {
+        overall = {
             **progress.loss_means("holdout/loss_"),
             "holdout/ade_80step": mean_or_nan(
                 progress.ade_sum, progress.ade_count
@@ -238,6 +366,7 @@ class TrainingRun:
             ),
             "holdout/targets": progress.sample_count,
         }
+        return HoldoutScores(overall, by_type.scalars("holdout_"))
 
     def main_decides(self, decision: bool) -> bool:
         """The main process's decision, sent to every process, so all of them
@@ -277,7 +406,7 @@ class TrainingRun:
         renames leaves behind.
         """
         if not self.arguments.resume:
-            return 0, None
+            return 0, None, None
         path = self.arguments.checkpoint_path
         fallback = previous_path(path)
         missing = not path.exists() and fallback.exists()
@@ -289,7 +418,7 @@ class TrainingRun:
         if self.process_count > 1:
             distributed.barrier()
         if not path.exists():
-            return 0, None
+            return 0, None, None
         checkpoint = load_checkpoint(path, self.device)
         plan_record = checkpoint.get("epoch_plan") or {}
         if not plan_record.get("designated_only", True):
@@ -312,7 +441,52 @@ class TrainingRun:
         completed = checkpoint["completed_epochs"]
         print(f"resuming {path}: {completed} epochs complete")
         stored = EpochPlan.stored(checkpoint.get("epoch_plan"))
-        return completed, stored
+        return completed, stored, checkpoint.get("plateau")
+
+    def restore_plateau(self, record: dict | None) -> PlateauState | None:
+        """The plateau state a resumed run carries on from, checked against
+        this command line: a run trained one way is not resumed the other,
+        and a fall already under way keeps its length. A branch copy saved
+        as the flat phase ended takes any --decay-epochs.
+        """
+        path = self.arguments.checkpoint_path
+        if self.rule is None:
+            if record is not None:
+                raise ValueError(
+                    f"{path} was trained with --decay-on-plateau; resume it"
+                    " with the same plateau settings"
+                )
+            return None
+        if record is None:
+            if self.completed_epochs:
+                raise ValueError(
+                    f"{path} was trained without --decay-on-plateau; start"
+                    " a fresh run instead"
+                )
+            return PlateauState.fresh()
+        state = PlateauState(**record)
+        fall = self.arguments.decay_epochs
+        if state.fall_epochs is not None and state.fall_epochs != fall:
+            raise ValueError(
+                f"{path} is part way through a {state.fall_epochs}-epoch"
+                f" fall; resume with --decay-epochs {state.fall_epochs}"
+            )
+        if state.flat_epochs is not None:
+            needed = state.flat_epochs + fall
+            if needed > self.arguments.epochs:
+                raise ValueError(
+                    f"{state.flat_epochs} flat epochs and a {fall}-epoch"
+                    f" fall need --epochs {needed} or more"
+                )
+        return state
+
+    def planned_epochs(self) -> int:
+        """The epochs this run trains in all: --epochs, or once the flat
+        phase has ended, its length plus the fall.
+        """
+        if self.plateau is None or self.plateau.flat_epochs is None:
+            return self.arguments.epochs
+        return self.plateau.flat_epochs + self.arguments.decay_epochs
 
     def batch_settings(self, epoch_index: int) -> BatchSettings:
         arguments = self.arguments
@@ -358,6 +532,10 @@ class TrainingRun:
         steps = self.plan.steps_per_epoch
         decay_start = None
         decay_end = None
+        if self.plateau is not None and self.plateau.flat_epochs is not None:
+            flat_epochs = self.plateau.flat_epochs
+            decay_start = max(flat_epochs * steps, arguments.warmup_steps)
+            decay_end = (flat_epochs + arguments.decay_epochs) * steps
         if arguments.decay_from_epoch is not None:
             # The fall starts no earlier than the end of warm-up, so the
             # rate never drops from the peak in one step.
@@ -384,6 +562,8 @@ class TrainingRun:
             "code_version": layout.STAGING_CODE_VERSION,
             "epoch_plan": self.plan._asdict(),
         }
+        if self.plateau is not None:
+            state["plateau"] = self.plateau._asdict()
         save_checkpoint(destination, state)
         updates_resume = destination == self.arguments.checkpoint_path
         if updates_resume:
@@ -469,20 +649,56 @@ class TrainingRun:
             f"{prefix}: {elapsed / SECONDS_PER_HOUR:.2f} h elapsed against a"
             f" --stop-after-seconds budget of"
             f" {arguments.stop_after_seconds / SECONDS_PER_HOUR:.2f} h."
-            f" {completed} of {arguments.epochs} epochs are complete and"
+            f" {completed} of {self.planned_epochs()} epochs are complete and"
             f" {arguments.checkpoint_path} holds {self.saved_epochs}."
+        )
+
+    def begin_fall(self, epoch_index: int) -> None:
+        """Fixes the fall's length in the plateau state as its first epoch
+        starts, so a later session cannot change it part way.
+        """
+        state = self.plateau
+        if state is None or state.flat_epochs is None:
+            return
+        if state.fall_epochs is None and epoch_index >= state.flat_epochs:
+            fall = self.arguments.decay_epochs
+            self.plateau = state._replace(fall_epochs=fall)
+
+    def advance_plateau(self, epoch: int, holdout_ade: float) -> bool:
+        """Folds a finished epoch's held-out minADE into the plateau state;
+        returns whether the flat phase ended with it, in which case the
+        schedule now holds the fall.
+        """
+        if self.plateau is None or self.plateau.flat_epochs is not None:
+            return False
+        self.plateau = self.rule.after_epoch(self.plateau, epoch, holdout_ade)
+        if self.plateau.flat_epochs is None:
+            return False
+        self.schedule = self.learning_rate_schedule()
+        return True
+
+    def save_branch(self, completed: int) -> None:
+        """Keeps a copy of the checkpoint as the flat phase ended, from which
+        falls of other lengths can be resumed.
+        """
+        branch = branch_path(self.arguments.checkpoint_path)
+        self.save(completed, branch)
+        print(
+            f"flat phase ended after epoch {completed}; {branch} keeps it."
+            f" Resume to run the {self.arguments.decay_epochs}-epoch fall."
         )
 
     def run(self) -> None:
         """Trains the remaining epochs inside the time budget, checkpointing
-        after each finished epoch.
+        after each finished epoch. With --decay-on-plateau the session also
+        ends where the flat phase does.
         """
         arguments = self.arguments
-        remaining = range(self.completed_epochs, arguments.epochs)
         budget = arguments.stop_after_seconds
         start = self.launch_time
         last_epoch_seconds = 0.0
-        for epoch_index in remaining:
+        epoch_index = self.completed_epochs
+        while epoch_index < self.planned_epochs():
             # Stop before an epoch that would not fit in the time budget,
             # since Kaggle ends a session without warning.
             elapsed = time.perf_counter() - start
@@ -491,20 +707,30 @@ class TrainingRun:
                 print(self.stop_message(heading, elapsed, epoch_index))
                 return
 
+            self.begin_fall(epoch_index)
             epoch_start = time.perf_counter()
             settings = self.batch_settings(epoch_index)
             batches = pipeline.batches(self.paths, settings)
             scalars = self.train_epoch(batches, epoch_index)
             last_epoch_seconds = time.perf_counter() - epoch_start
-            heading = f"epoch {epoch_index + 1}/{arguments.epochs}"
+            heading = f"epoch {epoch_index + 1}/{self.planned_epochs()}"
             self.report(heading, scalars, epoch_index + 1)
+            holdout_ade = math.nan
             if self.holdout_paths and self.is_main:
                 holdout = self.evaluate_holdout()
+                holdout_ade = holdout.overall["holdout/ade_80step"]
                 heading = f"held-out after epoch {epoch_index + 1}"
-                self.report(heading, holdout, epoch_index + 1)
+                self.report(heading, holdout.overall, epoch_index + 1)
+                heading = f"held-out by type after epoch {epoch_index + 1}"
+                self.report(heading, holdout.by_type, epoch_index + 1)
 
             total = scalars["epoch/loss_total"]
+            flat_phase_ended = False
             if math.isfinite(total):
+                # Only an epoch whose weights are kept moves the plateau.
+                flat_phase_ended = self.advance_plateau(
+                    epoch_index + 1, holdout_ade
+                )
                 recorded, destination = checkpoint_destination(
                     self.arguments.checkpoint_path, epoch_index, True
                 )
@@ -514,12 +740,16 @@ class TrainingRun:
                     f"epoch {epoch_index + 1} mean total loss {total},"
                     f" checkpoint left as it was"
                 )
+            if flat_phase_ended:
+                self.save_branch(epoch_index + 1)
+                return
 
             elapsed = time.perf_counter() - start
             if self.main_decides(elapsed >= budget):
                 completed = epoch_index + 1
                 print(self.stop_message("STOPPING EARLY", elapsed, completed))
                 return
+            epoch_index += 1
         print(
             f"done: {arguments.checkpoint_path} holds"
             f" {self.saved_epochs} epochs"
@@ -529,6 +759,11 @@ class TrainingRun:
 def epochs_recorded(epoch_index: int, finished: bool) -> int:
     """The completed-epoch count a checkpoint write stores for this epoch."""
     return epoch_index + int(finished)
+
+
+def branch_path(checkpoint_path: Path) -> Path:
+    """Where a plateau run keeps its checkpoint as the flat phase ended."""
+    return checkpoint_path.with_suffix(checkpoint_path.suffix + ".flat")
 
 
 def checkpoint_destination(path: Path, epoch_index: int, finished: bool):
@@ -554,7 +789,10 @@ def checkpoint_destination(path: Path, epoch_index: int, finished: bool):
 #         warm-up         hold          cosine fall, reaching
 #                                       zero on the last step
 #
-#   The fall starts at --decay-from-epoch and is off without it.
+#   The fall starts at --decay-from-epoch and is off without it. With
+#   --decay-on-plateau the hold instead ends where held-out minADE stalls
+#   (PlateauRule), the session stops there, and the resumed run falls
+#   over --decay-epochs.
 # ------------------------------------------------------------------
 
 if __name__ == "__main__":
