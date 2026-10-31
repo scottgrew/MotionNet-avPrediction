@@ -7,11 +7,14 @@ SHARDS ?= data/validation_raw/validation.tfrecord-00000-of-00150
 STAGED ?= data/staged
 STAGED_TRAINING ?= data/staged_training
 ANCHORS ?= data/training_anchors_54_8s.npz
-CHECKPOINT ?= data/run37/checkpoint.pt
+CHECKPOINT ?= data/run41_session2/checkpoint.pt
 PREDICTIONS ?= data/predictions.npz
 BASELINE_PREDICTIONS ?= data/constant_velocity_predictions.npz
 SCORE_DIRECTORY ?= data/score
 ONNX ?= data/model.onnx
+
+ROLLING_DIRECTORY ?= data/rolling
+ROLLING_SCENES ?= $(wordlist 1, 3, $(sort $(wildcard $(STAGED)/*.npz)))
 
 EPOCHS ?= 16
 DECAY_FROM_EPOCH ?= 11
@@ -31,7 +34,7 @@ EXPORT_THREADS ?= 4
 
 .DEFAULT_GOAL := help
 .PHONY: help install protos test check stage anchors train predict \
-	baseline score check-protos export live
+	baseline score check-protos export live rolling
 
 help: ## list the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | \
@@ -108,3 +111,7 @@ export: ## export to ONNX, check it against torch, time both
 
 live: ## play staged scenes with live predictions on ws://127.0.0.1:8765
 	$(PYTHON) live.py $(CHECKPOINT) $(STAGED)
+
+rolling: ## record every-step predictions as .mcap for Lichtblick
+	$(PYTHON) rolling.py $(CHECKPOINT) $(ROLLING_DIRECTORY) \
+		$(ROLLING_SCENES)

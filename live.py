@@ -18,6 +18,7 @@ import foxglove
 import numpy as np
 from foxglove import messages
 from foxglove.channels import SceneUpdateChannel
+from foxglove.messages import Timestamp
 from numpy import ndarray
 
 import submit
@@ -93,18 +94,17 @@ def line_strip(positions: ndarray, width: float, line_color: messages.Color):
     )
 
 
-def scene_update(name: str, **primitives: list) -> messages.SceneUpdate:
+def scene_update(name: str, stamp: Timestamp, **primitives: list):
     """One scene-frame entity; sending another with the same name replaces
     it in the viewer.
     """
-    timestamp = messages.Timestamp.now()
     entity = messages.SceneEntity(
-        timestamp=timestamp, frame_id=FRAME_ID, id=name, **primitives
+        timestamp=stamp, frame_id=FRAME_ID, id=name, **primitives
     )
     return messages.SceneUpdate(entities=[entity])
 
 
-def map_update(scenario: StagedFile) -> messages.SceneUpdate:
+def map_update(scenario: StagedFile, stamp: Timestamp) -> messages.SceneUpdate:
     """Every map feature as one line through its dots, coloured by kind."""
     split_at = np.cumsum(scenario.feature_lengths)[:-1]
     lines = []
@@ -113,7 +113,7 @@ def map_update(scenario: StagedFile) -> messages.SceneUpdate:
         positions = feature_rows[:, layout.MAP_POSITION]
         kind_color = MAP_KIND_COLORS[kind]
         lines.append(line_strip(positions, MAP_LINE_WIDTH, kind_color))
-    return scene_update("map", lines=lines)
+    return scene_update("map", stamp, lines=lines)
 
 
 def agent_color(rows: ndarray, is_target: bool) -> messages.Color:
@@ -124,7 +124,7 @@ def agent_color(rows: ndarray, is_target: bool) -> messages.Color:
     return AGENT_TYPE_COLORS[rows[layout.AGENT_TYPE].argmax()]
 
 
-def agents_update(scenario: StagedFile, tracks: ndarray, step: int):
+def agents_update(scenario, tracks: ndarray, step: int, stamp: Timestamp):
     """A box for every track valid at the step, the predicted tracks in
     orange.
     """
@@ -141,10 +141,10 @@ def agents_update(scenario: StagedFile, tracks: ndarray, step: int):
         box_color = agent_color(rows, track_index in tracks)
         box = messages.CubePrimitive(pose=pose, size=size, color=box_color)
         cubes.append(box)
-    return scene_update("agents", cubes=cubes)
+    return scene_update("agents", stamp, cubes=cubes)
 
 
-def futures_update(scenario: StagedFile, tracks: ndarray, kept: Kept):
+def futures_update(scenario, tracks: ndarray, kept: Kept, stamp: Timestamp):
     """Each predicted track's 6 futures in the scene frame, starting at its
     current position, more opaque the more confident.
     """
@@ -162,14 +162,12 @@ def futures_update(scenario: StagedFile, tracks: ndarray, kept: Kept):
             line_color = color(*TARGET_RGB, alpha=opacity)
             line = line_strip(positions, FUTURE_LINE_WIDTH, line_color)
             lines.append(line)
-    return scene_update("futures", lines=lines)
+    return scene_update("futures", stamp, lines=lines)
 
 
-def deletion_update() -> messages.SceneUpdate:
+def deletion_update(stamp: Timestamp) -> messages.SceneUpdate:
     deletion = messages.SceneEntityDeletion(
-        timestamp=messages.Timestamp.now(),
-        type=messages.SceneEntityDeletionType.All,
-        id="",
+        timestamp=stamp, type=messages.SceneEntityDeletionType.All, id=""
     )
     return messages.SceneUpdate(deletions=[deletion])
 
@@ -195,7 +193,8 @@ class LiveView:
         start = time.perf_counter()
         kept = submit.predict_scene(self.predict, scenario, tracks)
         milliseconds = 1000 * (time.perf_counter() - start)
-        self.futures_channel.log(futures_update(scenario, tracks, kept))
+        now = messages.Timestamp.now()
+        self.futures_channel.log(futures_update(scenario, tracks, kept, now))
         print(
             f"{scenario.scenario_id}: {len(tracks)} targets predicted in"
             f" {milliseconds:.0f} ms"
@@ -207,14 +206,18 @@ class LiveView:
         step on the designated targets.
         """
         tracks = views.designated_tracks(scenario)
-        self.futures_channel.log(deletion_update())
-        self.map_channel.log(map_update(scenario))
+        now = messages.Timestamp.now()
+        self.futures_channel.log(deletion_update(now))
+        self.map_channel.log(map_update(scenario, now))
         start = time.monotonic()
         step_count = scenario.track_valid.shape[1]
         for step in range(step_count):
             due = start + step * layout.TIMESTEP_SECONDS
             time.sleep(max(0.0, due - time.monotonic()))
-            self.agents_channel.log(agents_update(scenario, tracks, step))
+            step_time = messages.Timestamp.now()
+            self.agents_channel.log(
+                agents_update(scenario, tracks, step, step_time)
+            )
             if step == layout.CURRENT_STEP_INDEX:
                 self.predict_now(scenario, tracks)
 

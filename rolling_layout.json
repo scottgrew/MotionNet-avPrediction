@@ -1,0 +1,31 @@
+{
+  "configById": {
+    "3D!rolling": {
+      "followTf": "scene",
+      "followMode": "follow-pose",
+      "topics": {
+        "/map": { "visible": true },
+        "/agents": { "visible": true },
+        "/futures": { "visible": true },
+        "/truth": { "visible": true }
+      }
+    },
+    "Plot!error": {
+      "paths": [
+        {
+          "value": "/error.min_fde_3s_metres",
+          "enabled": true
+        }
+      ]
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": { "speed": 1 },
+  "layout": {
+    "direction": "row",
+    "first": "3D!rolling",
+    "second": "Plot!error",
+    "splitPercentage": 65
+  }
+}

@@ -62,6 +62,50 @@ def designated_tracks(scenario: StagedFile) -> ndarray:
     return track_indices
 
 
+def scene_at_step(scenario: StagedFile, step: int) -> StagedFile:
+    """Re-stages the scenario so ``step`` is the current step and the prior
+    1.1 s of agent history still fits in the 11 history slots.
+
+    Staged files hold only 11 steps of traffic-signal history (the first
+    ``HISTORY_STEPS`` of ``dynamic_map_states``). When the window moves
+    forward, later history slots that were never staged are filled with
+    ``LANE_STATE_UNKNOWN`` on signalled polylines and left zero elsewhere.
+    """
+    last_step = layout.TOTAL_STEPS - 1
+    if step < layout.CURRENT_STEP_INDEX or step > last_step:
+        raise ValueError(
+            f"{scenario.scenario_id}: step {step} not in"
+            f" [{layout.CURRENT_STEP_INDEX}, {last_step}]"
+        )
+    offset = step - layout.CURRENT_STEP_INDEX
+    step_axis = np.arange(layout.TOTAL_STEPS)
+    source = step_axis + offset
+    in_range = source < layout.TOTAL_STEPS
+    track_rows = np.zeros_like(scenario.track_rows)
+    track_valid = np.zeros_like(scenario.track_valid)
+    track_rows[:, in_range] = scenario.track_rows[:, source[in_range]]
+    track_valid[:, in_range] = scenario.track_valid[:, source[in_range]]
+
+    unknown_index = layout.TRAFFIC_SIGNAL_STATES.index("LANE_STATE_UNKNOWN")
+    unknown = np.zeros(layout.NUM_TRAFFIC_SIGNAL_STATES, dtype=np.float32)
+    unknown[unknown_index] = 1.0
+    histories = scenario.polyline_signal_histories
+    signalled = histories.any(axis=(1, 2))
+    new_signals = np.zeros_like(histories)
+    history_axis = np.arange(layout.HISTORY_STEPS)
+    original_slot = offset + history_axis
+    known = original_slot <= layout.CURRENT_STEP_INDEX
+    new_signals[:, known] = histories[:, original_slot[known]]
+    for slot in history_axis[~known]:
+        new_signals[signalled, slot] = unknown
+
+    return scenario._replace(
+        track_rows=track_rows,
+        track_valid=track_valid,
+        polyline_signal_histories=new_signals,
+    )
+
+
 class SceneChunks(NamedTuple):
     """A scene's map dots grouped into chunks of up to MAP_CHUNK_DOTS dots
     along each polyline, in the scene frame.
