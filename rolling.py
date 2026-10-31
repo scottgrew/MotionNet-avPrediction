@@ -1,6 +1,8 @@
 """Runs the trained model at every scenario step and writes one MCAP per staged
 file. Open a recording in Lichtblick and import rolling_layout.json from the
-Layouts tab to watch map, agents, futures, truth and the 3 s error plot.
+Layouts tab to watch map, agents, futures, truth and two error plots: min-FDE
+at a fixed 3 s ahead shows what the model knows; min-FDE at the scene's end
+shrinks with the remaining horizon and shows the narrowing on screen.
 """
 
 from __future__ import annotations
@@ -39,19 +41,21 @@ TIMESTEP_NANOSECONDS = int(layout.TIMESTEP_SECONDS * 1_000_000_000)
 # A fixed horizon, so the curve moves with what the model knows, not with
 # how much of the future is left to miss.
 ERROR_HORIZON_SECONDS = 3.0
-# Thinner than a future and half transparent, so the orange futures stay
-# what is watched and the logged path reads as the reference under them.
+ERROR_HORIZON_STEPS = round(ERROR_HORIZON_SECONDS / layout.TIMESTEP_SECONDS)
+# Magenta, a colour no agent, map line or future uses, so the logged path
+# reads as the reference on a light or a dark background; thinner than a
+# future so the orange futures stay what is watched.
 TRUTH_LINE_WIDTH = 0.12
-TRUTH_OPACITY = 0.5
+TRUTH_COLOR = color(0.9, 0.1, 0.9, 0.9)
 
 ERROR_SCHEMA = json.dumps(
     {
         "type": "object",
         "properties": {
-            "min_fde_3s_metres": {"type": "number"},
+            "min_fde_metres": {"type": "number"},
             "targets": {"type": "integer"},
         },
-        "required": ["min_fde_3s_metres", "targets"],
+        "required": ["min_fde_metres", "targets"],
     }
 ).encode()
 
@@ -63,21 +67,16 @@ def log_timestamp(step: int) -> Timestamp:
     )
 
 
-def error_submission_slot() -> int:
-    future_index = round(ERROR_HORIZON_SECONDS / layout.TIMESTEP_SECONDS) - 1
-    assert future_index in layout.SUBMISSION_FUTURE_INDICES
-    return layout.SUBMISSION_FUTURE_INDICES.index(future_index)
-
-
-def min_fde_3s_metres(shifted: StagedFile, tracks: ndarray, kept: Kept):
-    """Mean over tracks of each one's smallest mode error at the fixed 3 s
-    horizon, in the scene frame. Returns None when no track has a valid 3 s
-    position.
+def min_fde_metres(shifted, tracks: ndarray, kept: Kept, horizon: int):
+    """Mean over tracks of each one's smallest mode error horizon steps after
+    now, in the scene frame. Returns None when horizon - 1 is not a submission
+    future index, or when no track is valid at CURRENT_STEP_INDEX + horizon.
     """
-    submission_slot = error_submission_slot()
-    horizon_step = layout.CURRENT_STEP_INDEX + round(
-        ERROR_HORIZON_SECONDS / layout.TIMESTEP_SECONDS
-    )
+    future_index = horizon - 1
+    if future_index not in layout.SUBMISSION_FUTURE_INDICES:
+        return None
+    submission_slot = layout.SUBMISSION_FUTURE_INDICES.index(future_index)
+    horizon_step = layout.CURRENT_STEP_INDEX + horizon
     errors = []
     for track_index, paths in zip(tracks, kept.trajectories.numpy()):
         if not shifted.track_valid[track_index, horizon_step]:
@@ -92,7 +91,7 @@ def min_fde_3s_metres(shifted: StagedFile, tracks: ndarray, kept: Kept):
         errors.append(float(distances.min()))
     if not errors:
         return None
-    return {"min_fde_3s_metres": float(np.mean(errors)), "targets": len(errors)}
+    return {"min_fde_metres": float(np.mean(errors)), "targets": len(errors)}
 
 
 def truth_paths(scenario, tracks: ndarray, step: int) -> list[ndarray]:
@@ -111,9 +110,8 @@ def truth_paths(scenario, tracks: ndarray, step: int) -> list[ndarray]:
 
 
 def truth_update(scenario, tracks: ndarray, step: int, stamp: Timestamp):
-    white = color(1.0, 1.0, 1.0, alpha=TRUTH_OPACITY)
     paths = truth_paths(scenario, tracks, step)
-    lines = [line_strip(path, TRUTH_LINE_WIDTH, white) for path in paths]
+    lines = [line_strip(path, TRUTH_LINE_WIDTH, TRUTH_COLOR) for path in paths]
     return scene_update("truth", stamp, lines=lines)
 
 
@@ -155,9 +153,20 @@ def recording(scenario, predict: Predict):
             truth_update(scenario, predict_tracks, step, stamp),
         )
         if kept is not None:
-            error = min_fde_3s_metres(shifted, predict_tracks, kept)
-            if error is not None:
-                yield ("/error", log_time, error)
+            error_3s = min_fde_metres(
+                shifted, predict_tracks, kept, ERROR_HORIZON_STEPS
+            )
+            if error_3s is not None:
+                yield ("/error/3s", log_time, error_3s)
+            # Its horizon shrinks as the scene plays, so it falls even when
+            # the model knows nothing new; it shows the narrowing, the 3 s
+            # curve shows the model.
+            end_horizon = layout.TOTAL_STEPS - 1 - step
+            error_end = min_fde_metres(
+                shifted, predict_tracks, kept, end_horizon
+            )
+            if error_end is not None:
+                yield ("/error/end", log_time, error_end)
 
 
 def write_scene(scenario, predict: Predict, output_path: Path) -> float:
@@ -171,12 +180,19 @@ def write_scene(scenario, predict: Predict, output_path: Path) -> float:
     agents_channel = SceneUpdateChannel("/agents", context=context)
     futures_channel = SceneUpdateChannel("/futures", context=context)
     truth_channel = SceneUpdateChannel("/truth", context=context)
-    error_channel = foxglove.Channel(
-        "/error",
+    error_schema = foxglove.Schema(
+        name="error", encoding="jsonschema", data=ERROR_SCHEMA
+    )
+    error_3s_channel = foxglove.Channel(
+        "/error/3s",
         message_encoding="json",
-        schema=foxglove.Schema(
-            name="error", encoding="jsonschema", data=ERROR_SCHEMA
-        ),
+        schema=error_schema,
+        context=context,
+    )
+    error_end_channel = foxglove.Channel(
+        "/error/end",
+        message_encoding="json",
+        schema=error_schema,
         context=context,
     )
     channels = {
@@ -184,12 +200,14 @@ def write_scene(scenario, predict: Predict, output_path: Path) -> float:
         "/agents": agents_channel,
         "/futures": futures_channel,
         "/truth": truth_channel,
-        "/error": error_channel,
+        "/error/3s": error_3s_channel,
+        "/error/end": error_end_channel,
     }
+    error_topics = frozenset({"/error/3s", "/error/end"})
     start = time.perf_counter()
     for topic, log_time, message in recording(scenario, predict):
         channel = channels[topic]
-        if topic == "/error":
+        if topic in error_topics:
             channel.log(json.dumps(message).encode(), log_time=log_time)
         else:
             channel.log(message, log_time=log_time)

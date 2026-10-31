@@ -13,8 +13,14 @@
     "Plot!error": {
       "paths": [
         {
-          "value": "/error.min_fde_3s_metres",
-          "enabled": true
+          "value": "/error/3s.min_fde_metres",
+          "enabled": true,
+          "label": "min-FDE at 3 s ahead, m"
+        },
+        {
+          "value": "/error/end.min_fde_metres",
+          "enabled": true,
+          "label": "min-FDE at the scene's end, m"
         }
       ]
     }

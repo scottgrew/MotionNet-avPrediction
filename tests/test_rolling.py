@@ -8,7 +8,7 @@ import torch
 from test_invariants import two_lane_signal_scenario
 
 import submit
-from rolling import min_fde_3s_metres, recording, truth_paths
+from rolling import min_fde_metres, recording, truth_paths
 from womd import layout, views
 from womd.formats import StagedFile
 from womd.pruning import SubmittedModes
@@ -86,7 +86,7 @@ def test_scene_at_step_rejects_out_of_range():
         views.scene_at_step(scenario, 91)
 
 
-def test_min_fde_3s_averages_valid_tracks():
+def test_min_fde_metres_averages_valid_tracks():
     history = go_signal_history()
     scenario = two_lane_signal_scenario(2, history)
     rows = vehicle_track_rows(2)
@@ -106,8 +106,35 @@ def test_min_fde_3s_averages_valid_tracks():
     invalid = shifted.track_valid.copy()
     invalid[1, horizon] = False
     shifted = shifted._replace(track_valid=invalid)
-    result = min_fde_3s_metres(shifted, np.array([0, 1]), kept)
-    assert result == {"min_fde_3s_metres": 5.0, "targets": 1}
+    result = min_fde_metres(
+        shifted, np.array([0, 1]), kept, round(3.0 / layout.TIMESTEP_SECONDS)
+    )
+    assert result == {"min_fde_metres": 5.0, "targets": 1}
+
+
+def test_min_fde_metres_submission_slot_and_invalid_horizon():
+    history = go_signal_history()
+    scenario = two_lane_signal_scenario(2, history)
+    rows = vehicle_track_rows(1)
+    rows[:, :, layout.AGENT_POSITION] = 0.0
+    scenario = scenario._replace(track_rows=rows)
+    shifted = views.scene_at_step(scenario, 10)
+    end_step = layout.TOTAL_STEPS - 1
+    shifted = shifted._replace(track_rows=shifted.track_rows.copy())
+    shifted.track_rows[0, end_step, layout.AGENT_POSITION] = np.array(
+        [0.0, 0.0]
+    )
+    slot = layout.SUBMISSION_FUTURE_INDICES.index(79)
+    trajectories = np.zeros((1, 2, len(layout.SUBMISSION_FUTURE_INDICES), 2))
+    trajectories[0, :, slot] = np.array(
+        [[3.0, 0.0], [9.0, 0.0]], dtype=np.float32
+    )
+    kept = SubmittedModes(torch.from_numpy(trajectories), torch.ones(1, 2))
+    horizon_80 = layout.TOTAL_STEPS - 1 - 10
+    assert horizon_80 == 80
+    result = min_fde_metres(shifted, np.array([0]), kept, horizon_80)
+    assert result == {"min_fde_metres": 3.0, "targets": 1}
+    assert min_fde_metres(shifted, np.array([0]), kept, 7) is None
 
 
 def test_recording_counts_and_zero_error_for_stationary():
@@ -121,12 +148,13 @@ def test_recording_counts_and_zero_error_for_stationary():
     predict_steps = layout.TOTAL_STEPS - layout.CURRENT_STEP_INDEX
     assert topics["/futures"] == predict_steps
     assert topics["/truth"] == predict_steps
-    assert topics["/error"] == 51
+    assert topics["/error/3s"] == 51
+    assert topics["/error/end"] == 16
     times = [log_time for _topic, log_time, _message in messages]
     assert times == sorted(times)
     for topic, _time, message in messages:
-        if topic == "/error":
-            assert message["min_fde_3s_metres"] == 0.0
+        if topic in ("/error/3s", "/error/end"):
+            assert message["min_fde_metres"] == 0.0
 
 
 def test_truth_uses_valid_steps_only():
