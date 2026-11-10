@@ -17,21 +17,22 @@ closest of the six predictions. Lower is better.
 
 | minADE (m)                | 3 s  | 5 s  | 8 s   |
 |---------------------------|------|------|-------|
-| cars, validation          | 0.36 | 0.77 | 1.49  |
-| cars, test                | 0.36 | 0.77 | 1.49  |
+| cars, validation          | 0.35 | 0.74 | 1.44  |
+| cars, test                | 0.35 | 0.74 | 1.43  |
 | cars, control             | 2.33 | 5.47 | 10.98 |
 | pedestrians, validation   | 0.19 | 0.37 | 0.65  |
 | pedestrians, test         | 0.19 | 0.37 | 0.65  |
 | pedestrians, control      | 0.47 | 0.89 | 1.55  |
-| cyclists, validation      | 0.38 | 0.73 | 1.30  |
-| cyclists, test            | 0.37 | 0.73 | 1.31  |
+| cyclists, validation      | 0.38 | 0.71 | 1.26  |
+| cyclists, test            | 0.37 | 0.71 | 1.28  |
 | cyclists, control         | 1.14 | 2.26 | 4.17  |
 
-Validation: 44,097 scenes, scored by Waymo's metric code and confirmed
-by Waymo's evaluation server. Test: 44,920 scenes, graded by the server
-only. Control: constant speed and heading. Training: a quarter of the
-training split, 122,352 scenes, 16 epochs, two 12-hour sessions on a
-free Kaggle GPU. Not comparable to the public leaderboard.
+Validation: 44,097 scenes. Test: 44,920 scenes. Both graded by Waymo's
+evaluation server. Control: constant speed and heading, scored by
+Waymo's metric code on the validation scenes. Model: 12M parameters.
+Training: a quarter of the training split, 122,352 scenes, 20 epochs,
+two sessions on a free Kaggle GPU. Not comparable to the public
+leaderboard.
 
 ## Method
 
