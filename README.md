@@ -10,6 +10,12 @@ possible paths per road user, each with a confidence. A car approaching
 a junction may turn or continue straight, and a single prediction would
 average the two.
 
+![Predictions through a junction](docs/media/predictions.gif)
+
+*Orange boxes are the road users being predicted. The orange lines in
+front of each one are its predicted paths, and the magenta line is the
+path it actually took. The white box is the Waymo car.*
+
 ## Results
 
 minADE: the mean distance, in metres, between the recorded path and the
@@ -44,9 +50,9 @@ leaderboard.
    gentle left, hard right. These are the anchors. (`fit_anchors.py`)
 3. A transformer encodes the scene and, for each anchor, adjusts that
    anchor's path to fit it. A second head scores how likely each anchor
-   is. The loss is the paper's (MultiPath, Chai et al. 2019): each
-   training example trains the path of the anchor closest to the
-   recorded path, and trains the confidence toward that same anchor.
+   is. In the loss, each training example trains the path of the anchor
+   closest to the recorded path, and trains the confidence toward that
+   same anchor.
    (`womd/model.py`, `womd/loss.py`, `train.py`)
 4. At prediction time the 54 are ranked by confidence, near-duplicates
    are dropped, and the six highest are kept. (`womd/pruning.py`,
@@ -90,8 +96,3 @@ make live      # play staged scenes with live predictions
 To watch, open Lichtblick, import `lichtblick_layout.json` from the
 Layouts tab, run `make live`, then choose Open connection, Foxglove
 WebSocket and `ws://127.0.0.1:8765`.
-
-## References
-
-The scene encoder follows VectorNet (Gao et al., CVPR 2020). The
-decoder's anchor queries match MTR (Shi et al., NeurIPS 2022).
