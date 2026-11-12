@@ -37,7 +37,7 @@ The control assumes constant speed and heading, scored with Waymo's metric code 
 validation scenes. The model has 12M parameters and was trained for 20 epochs on 122,352
 scenes, a quarter of the training split.
 
-## How it works
+## Method
 
 1. Before training, the endpoints of the training paths are clustered with k-means into 54
    typical destinations per object type: straight and far, gentle left, hard right. These are
