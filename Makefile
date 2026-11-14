@@ -10,6 +10,11 @@ ANCHORS ?= data/training_anchors_54_8s.npz
 CHECKPOINT ?= data/run41_session2/checkpoint.pt
 PREDICTIONS ?= data/predictions.npz
 BASELINE_PREDICTIONS ?= data/constant_velocity_predictions.npz
+# Every agent near the SDC, for the planner. 1 m past the planner's 60 m, so
+# float32 scene-frame rounding cannot drop an agent the planner keeps; the
+# planner selects its 60 m exactly from its own world-frame positions.
+NEARBY_PREDICTIONS ?= data/predictions_nearby.npz
+NEARBY_RADIUS_METRES ?= 61
 SCORE_DIRECTORY ?= data/score
 ONNX ?= data/model.onnx
 
@@ -34,7 +39,7 @@ EXPORT_THREADS ?= 4
 
 .DEFAULT_GOAL := help
 .PHONY: help install protos test check stage anchors train predict \
-	baseline score check-protos export live rolling
+	predict-nearby baseline score check-protos export live rolling
 
 help: ## list the targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | \
@@ -91,6 +96,10 @@ train: ## train, resuming from the checkpoint if one exists
 
 predict: ## write the model's predictions for the staged scenarios
 	$(PYTHON) submit.py $(CHECKPOINT) $(STAGED) $(PREDICTIONS)
+
+predict-nearby: ## predict every agent near the SDC, for the planner
+	$(PYTHON) submit.py --within $(NEARBY_RADIUS_METRES) $(CHECKPOINT) \
+		$(STAGED) $(NEARBY_PREDICTIONS)
 
 baseline: ## write the constant-velocity predictions
 	$(PYTHON) submit.py --constant-velocity $(STAGED) \

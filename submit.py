@@ -20,7 +20,7 @@ from torch import Tensor
 
 from womd import baseline, formats, frames, pruning, views
 from womd.checkpoint import load_predictor
-from womd.formats import StagedFile
+from womd.formats import StagedFile, Submission
 from womd.model import MotionPredictor
 from womd.views import TargetInputs
 
@@ -28,6 +28,8 @@ from womd.views import TargetInputs
 # trajectories (B, modes, 80, 2) and confidence logits (B, modes).
 Modes = tuple[Tensor, Tensor]
 Predict = Callable[[TargetInputs], Modes]
+# A selection picks the indices of the tracks to predict in one scene.
+Select = Callable[[StagedFile], ndarray]
 
 
 def model_modes(predictor: MotionPredictor, batch: TargetInputs) -> Modes:
@@ -56,9 +58,9 @@ def predict_scene(predict: Predict, scenario: StagedFile, tracks: ndarray):
     return pruning.submitted_modes(trajectories, logits)
 
 
-def submission(predict: Predict, staged: Path) -> formats.Submission:
-    """Predicts the designated targets one scene at a time and converts each
-    target's 6 futures to the world frame.
+def submission(predict: Predict, staged: Path, select: Select) -> Submission:
+    """Predicts the tracks `select` picks in each scene, one scene at a time,
+    and converts each track's 6 futures to the world frame.
     """
     scenario_ids = []
     track_ids = []
@@ -66,7 +68,7 @@ def submission(predict: Predict, staged: Path) -> formats.Submission:
     confidences = []
     for path in sorted(staged.glob("*.npz")):
         scenario = formats.StagedFile.load(path)
-        tracks = views.designated_tracks(scenario)
+        tracks = select(scenario)
         if len(tracks) == 0:
             continue
         kept = predict_scene(predict, scenario, tracks)
@@ -80,8 +82,8 @@ def submission(predict: Predict, staged: Path) -> formats.Submission:
             world_trajectories.append(world)
             confidences.append(scores)
     if not scenario_ids:
-        raise ValueError(f"{staged}: no staged scene has a designated target")
-    return formats.Submission(
+        raise ValueError(f"{staged}: no staged scene has a track to predict")
+    return Submission(
         scenario_id=np.array(scenario_ids),
         track_id=np.array(track_ids, dtype=np.int64),
         world_trajectories=np.stack(world_trajectories),
@@ -96,8 +98,20 @@ def main() -> None:
     """
     parser = argparse.ArgumentParser()
     parser.add_argument("--constant-velocity", action="store_true")
+    parser.add_argument(
+        "--within",
+        type=float,
+        metavar="METRES",
+        help="predict every agent within METRES of the SDC, not the"
+        " designated targets",
+    )
     parser.add_argument("paths", nargs="+", type=Path)
     arguments = parser.parse_args()
+    select = views.designated_tracks
+    if arguments.within is not None:
+        select = functools.partial(
+            views.tracks_within, radius_metres=arguments.within
+        )
     if arguments.constant_velocity:
         if len(arguments.paths) != 2:
             raise SystemExit(
@@ -112,11 +126,11 @@ def main() -> None:
         predictor = load_predictor(checkpoint_path)
         predict = functools.partial(model_modes, predictor)
 
-    predicted = submission(predict, staged)
+    predicted = submission(predict, staged, select)
     predicted.save(output)
     size = output.stat().st_size
     print(
-        f"{len(predicted.track_id)} designated targets written to {output}"
+        f"{len(predicted.track_id)} tracks written to {output}"
         f" ({size} bytes)"
     )
 

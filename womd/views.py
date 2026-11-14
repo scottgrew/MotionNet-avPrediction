@@ -62,6 +62,19 @@ def designated_tracks(scenario: StagedFile) -> ndarray:
     return track_indices
 
 
+def tracks_within(scenario: StagedFile, radius_metres: float) -> ndarray:
+    """Every predictable track but the SDC whose current position is within
+    radius_metres of the scene origin, which is the SDC at the current step:
+    the agents a planner on the SDC has to reckon with, designated or not.
+    """
+    tracks = eligible_tracks(scenario, designated_only=False)
+    now_rows = scenario.track_rows[tracks, layout.CURRENT_STEP_INDEX]
+    positions = now_rows[:, layout.AGENT_POSITION]
+    is_near = (positions**2).sum(axis=1) <= radius_metres**2
+    is_sdc = now_rows[:, layout.AGENT_IS_SDC] > 0
+    return tracks[is_near & ~is_sdc]
+
+
 def scene_at_step(scenario: StagedFile, step: int) -> StagedFile:
     """Re-stages the scenario so ``step`` is the current step and the prior
     1.1 s of agent history still fits in the 11 history slots.

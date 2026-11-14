@@ -613,6 +613,38 @@ def test_submission_returns_to_the_world_frame():
     )
 
 
+def test_tracks_within_selects_by_distance_type_and_validity():
+    """tracks_within keeps every predictable non-SDC track valid now within
+    the radius of the scene origin, designated or not, and nothing else.
+    """
+    placed = [
+        # (x, y, type column, is SDC, valid now, designated)
+        (0.0, 0.0, 0, True, True, False),  # the SDC: never kept
+        (59.9, 0.0, 0, False, True, True),  # inside
+        (0.0, -60.1, 0, False, True, True),  # just outside
+        (6.0, 8.0, 1, False, True, False),  # a pedestrian, not designated
+        (3.0, 0.0, 3, False, True, True),  # TYPE_OTHER is not predicted
+        (2.0, 0.0, 0, False, False, True),  # not valid now
+        (-30.0, 40.0, 2, False, True, False),  # a cyclist at exactly 50 m
+    ]
+    scenario = two_lane_signal_scenario(len(placed), np.zeros(1))
+    track_rows = scenario.track_rows.copy()
+    track_valid = scenario.track_valid.copy()
+    for track, (x, y, type_column, is_sdc, valid, _) in enumerate(placed):
+        track_rows[track, :, layout.AGENT_POSITION] = (x, y)
+        track_rows[track, :, layout.AGENT_TYPE] = 0.0
+        track_rows[track, :, layout.AGENT_TYPE.start + type_column] = 1.0
+        track_rows[track, :, layout.AGENT_IS_SDC] = float(is_sdc)
+        track_valid[track, layout.CURRENT_STEP_INDEX] = valid
+    scenario = scenario._replace(
+        track_rows=track_rows,
+        track_valid=track_valid,
+        is_designated_target=np.array([row[5] for row in placed]),
+    )
+    assert views.tracks_within(scenario, 60.0).tolist() == [1, 3, 6]
+    assert views.tracks_within(scenario, 50.0).tolist() == [3, 6]
+
+
 def test_constant_velocity_null_keeps_the_logged_speed():
     """A straight-moving agent is carried at exactly its logged velocity."""
     logged_velocity = torch.tensor([[11.0, -4.0], [0.0, 0.0]])
