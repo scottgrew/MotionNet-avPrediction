@@ -69,28 +69,19 @@ flowchart TB
 
 ## Build and run
 
-Needs Python 3 and the pinned packages in `requirements.txt`. Waymo's own metrics package has
-no macOS build, so scoring runs in Docker. The input is the Waymo Open Motion Dataset's
-scenario TFRecords, which need a Waymo account. No trained model is included: stage the
-data, fit the anchors and train before predicting.
+Needs Python 3, and Docker for scoring, since Waymo's metrics package has no macOS build. The
+data is the Waymo Open Motion Dataset, which needs a Waymo account. No trained model is
+included.
 
 ```
-make install    # pinned dependencies
-make test       # test suite; tests that need staged scenes skip without them
-make stage      # raw scenario shards to one .npz per scene
-make anchors    # fit the 54 anchors on the staged training scenes
-make train      # train, resuming from the checkpoint if one exists
-make predict    # predictions for the staged scenes
-make score      # Waymo's metrics on a slice of staged scenes, in Docker
-make export     # export to ONNX, check it against PyTorch, time both
-make live       # play staged scenes with live predictions on ws://127.0.0.1:8765
+make install
+make stage      # one .npz per scene
+make anchors    # fit the 54 anchors
+make train
+make score      # Waymo's metrics, in Docker
 ```
 
-Paths default to folders under `data/`. Set `SHARDS`, `STAGED`, `STAGED_TRAINING`, `ANCHORS`
-or `CHECKPOINT` on the `make` command line, and run `make help` for the rest.
-
-To watch, open Lichtblick, import `lichtblick_layout.json` from the Layouts tab, run
-`make live`, then choose Open connection, Foxglove WebSocket and `ws://127.0.0.1:8765`.
+`make help` lists the rest, including ONNX export and a live view in Lichtblick.
 
 ## Known limitations
 
