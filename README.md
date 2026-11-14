@@ -1,4 +1,4 @@
-# MotionNet
+# MotionNet (diffusion decoder, experimental, work in progress)
 
 Motion prediction for the Waymo Open Motion Dataset, in Python and PyTorch. From one second of
 a road user's history, the traffic around it, the lane geometry and the traffic-light states,
